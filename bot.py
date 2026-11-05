@@ -9,15 +9,12 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 # =========================================================
-# 💰 RISK MANAGER SETTING
-# Aap ek trade mein maximum kitna loss afford kar sakte hain?
-# (Jaise ₹1000. Agar SL hit ho, toh sirf ₹1000 ka loss hoga)
+# 💰 RISK MANAGER SETTING (Aap ek trade mein max kitna loss le sakte hain?)
 # =========================================================
 RISK_PER_TRADE = 1000 
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Secrets missing!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
@@ -78,7 +75,6 @@ def scan_market(ticker, name, interval, period, style):
             sl = round(price - (atr * 1.5), 2)
             tp = round(price + (atr * 3.0), 2)
             
-            # Risk Manager (Position Sizing)
             sl_dist = abs(price - sl)
             qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
             
@@ -91,7 +87,6 @@ def scan_market(ticker, name, interval, period, style):
             sl = round(price + (atr * 1.5), 2)
             tp = round(price - (atr * 3.0), 2)
             
-            # Risk Manager (Position Sizing)
             sl_dist = abs(sl - price)
             qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
             
@@ -102,6 +97,9 @@ def scan_market(ticker, name, interval, period, style):
         pass 
 
 def main():
+    # Start hone par Telegram par message bhejega
+    send_telegram_alert("🤖 Bot scan kar raha hai...")
+    
     # Assets List (Crypto, Gold, Indian Stocks)
     assets = [
         ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM"), ("SOL-USD", "SOLANA"), 
@@ -110,7 +108,6 @@ def main():
         ("HDFCBANK.NS", "HDFC BANK"), ("^NSEI", "NIFTY 50"), ("INFY.NS", "INFOSYS")
     ]
 
-    # Scan all assets in different timeframes
     for t, n in assets: scan_market(t, n, "1d", "2y", "SWING")
     for t, n in assets: scan_market(t, n, "1h", "1y", "INTRADAY")
     for t, n in assets: scan_market(t, n, "15m", "60d", "SCALPING")
