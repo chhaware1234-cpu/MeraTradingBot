@@ -2,8 +2,8 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # Har 30 minute mein chalega
-  workflow_dispatch:        # Manually chalane ke liye button
+    - cron: '*/30 * * * *'  # Ab har 30 minute mein chalega
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,10 +18,12 @@ jobs:
           python-version: '3.10'
       
       - name: Install dependencies
-        run: pip install  yfinance requests pandas
+        run: pip install yfinance requests pandas python-binance
       
       - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
         run: python bot.py
