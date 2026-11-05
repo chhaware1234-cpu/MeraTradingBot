@@ -1,13 +1,24 @@
-import yfinance as yf
+     import yfinance as yf
 import requests
 import os
 import warnings
 import datetime
+from binance.client import Client
 warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 RISK_PER_TRADE = 1000 
+
+# --- BINANCE TESTNET CONNECTION ---
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY')
+
+try:
+    # testnet=True ka matlab fake money use ho raha hai
+    client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
+except Exception as e:
+    print("Binance connection failed. Check API keys.")
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
@@ -16,6 +27,19 @@ def send_telegram_alert(message):
     try:
         requests.post(url, data=payload)
     except Exception: pass
+
+def place_binance_order(symbol, side):
+    try:
+        # Test ke liye 0.001 BTC/ETH kharid/bech rahe hain
+        if side == "BUY":
+            order = client.order_market_buy(symbol=symbol, quantity=0.001)
+            return f"✅ TESTNET BUY Order Success! ID: {order['orderId']}"
+        elif side == "SELL":
+            order = client.order_market_sell(symbol=symbol, quantity=0.001)
+            return f"✅ TESTNET SELL Order Success! ID: {order['orderId']}"
+    except Exception as e:
+        return f"❌ Order Failed: {e}"
+    return ""
 
 def scan_market(ticker, name, interval, period, style):
     try:
@@ -28,7 +52,6 @@ def scan_market(ticker, name, interval, period, style):
         low = d["Low"].squeeze()
         volume = d["Volume"].squeeze()
         
-        # Indicators
         ema9 = close.ewm(span=9).mean().iloc[-1]
         ema21 = close.ewm(span=21).mean().iloc[-1]
         ema200 = close.ewm(span=200).mean().iloc[-1] 
@@ -52,82 +75,52 @@ def scan_market(ticker, name, interval, period, style):
         avg_vol = volume.rolling(20).mean().iloc[-1]
         vol_ratio = current_vol / avg_vol if avg_vol != 0 else 1
         
-        # --- NAYA: SUPPORT & RESISTANCE (Pichle 30 candles ka High/Low) ---
         recent_high = high.tail(30).max()
         recent_low = low.tail(30).min()
         
-        # Agar price apne recent High ke bahut paas hai (0.5% ke andar), toh BUY nahi karega
         near_resistance = price >= (recent_high * 0.995)
-        # Agar price apne recent Low ke bahut paas hai (0.5% ke andar), toh SELL nahi karega
         near_support = price <= (recent_low * 1.005)
 
-        c_open, c_close = open_p.iloc[-1], close.iloc[-1]
-        p_open, p_close = open_p.iloc[-2], close.iloc[-2]
-        bull_engulf = (c_close > c_open) and (p_close < p_open) and (c_close > p_open) and (c_open < p_close)
-        bear_engulf = (c_close < c_open) and (p_close > p_open) and (c_close < p_open) and (c_open > p_close)
-        candle_msg = "🕯️ Pattern" if (bull_engulf or bear_engulf) else ""
-
-        # --- BUY LOGIC (With S/R Filter) ---
+        # --- STRICT BUY LOGIC ---
         if ema9 > ema21 and price > ema200 and macd_bullish and rsi < 70 and vol_ratio >= 0.5:
-            if near_resistance:
-                pass # Resistance ke paas BUY nahi karna
-            else:
-                strength = "STRONG 🔥" if (bull_engulf and vol_ratio > 1.5) else "GOOD 👍"
+            if not near_resistance:
                 sl = round(price - (atr * 1.5), 2)
                 tp = round(price + (atr * 3.0), 2)
-                sl_dist = abs(price - sl)
-                qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
                 
-                msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\nQty: {qty} (Risk: ₹{RISK_PER_TRADE})\nStrength: {strength} {candle_msg}\n🛑 SL: {sl} | 🎯 TP: {tp}"
+                order_status = ""
+                # Sirf Crypto ke liye Testnet order lagayega (Stocks/Gold nahi)
+                if ".NS" not in ticker and ticker != "GC=F":
+                    binance_symbol = ticker.replace("-USD", "USDT")
+                    order_status = place_binance_order(binance_symbol, "BUY")
+                
+                msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
             
-        # --- SELL LOGIC (With S/R Filter & Overbought Bypass) ---
+        # --- STRICT SELL LOGIC ---
         elif ema9 < ema21 and price < ema200 and not macd_bullish and vol_ratio >= 0.5:
-            # Naya Expert Logic: Agar RSI bahut zyada gir gaya hai (jaise 25) par price support tod raha hai, toh sell karo. 
-            # Par agar price support ke bilkul upar hai (bounce aa sakta hai), toh skip karo.
-            if near_support and rsi < 35:
-                pass # Support par SELL nahi karna
-            elif rsi > 30 or price < recent_low: 
-                strength = "STRONG 🔥" if (bear_engulf and vol_ratio > 1.5) else "GOOD 👍"
+            if not (near_support and rsi < 35) and rsi > 30:
                 sl = round(price + (atr * 1.5), 2)
                 tp = round(price - (atr * 3.0), 2)
-                sl_dist = abs(sl - price)
-                qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
                 
-                msg = f"🔴 SELL SIGNAL 🔴\nAsset: {name} ({style})\nPrice: {price}\nQty: {qty} (Risk: ₹{RISK_PER_TRADE})\nStrength: {strength} {candle_msg}\n🛑 SL: {sl} | 🎯 TP: {tp}"
+                order_status = ""
+                if ".NS" not in ticker and ticker != "GC=F":
+                    binance_symbol = ticker.replace("-USD", "USDT")
+                    order_status = place_binance_order(binance_symbol, "SELL")
+                
+                msg = f"🔴 SELL SIGNAL 🔴\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
                 
     except Exception as e:
         pass 
 
 def main():
-    send_telegram_alert("🤖 Expert Bot Scan shuru... (With S/R Filter)")
+    send_telegram_alert("🤖 Bot Testnet Mode ON! Auto-Order Test shuru...")
     
-    utc_now = datetime.datetime.utcnow()
-    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
-    is_indian_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
-
-    assets = [
-        ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM"), ("SOL-USD", "SOLANA"), 
-        ("XRP-USD", "RIPPLE (XRP)"), ("BNB-USD", "BINANCE COIN"), ("DOGE-USD", "DOGECOIN"),
-        ("ADA-USD", "CARDANO"), ("MATIC-USD", "POLYGON"), ("DOT-USD", "POLKADOT"),
-        ("AVAX-USD", "AVALANCHE"), ("LINK-USD", "CHAINLINK"), ("GC=F", "GOLD")
-    ]
+    # Test ke liye sirf BTC aur ETH rakha hai taaki test jaldi ho
+    assets = [("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM")]
     
-    if is_indian_market_open:
-        assets.extend([
-            ("RELIANCE.NS", "RELIANCE"), ("TATAMOTORS.NS", "TATA MOTORS"),
-            ("HDFCBANK.NS", "HDFC BANK"), ("INFY.NS", "INFOSYS"),
-            ("TCS.NS", "TCS"), ("ICICIBANK.NS", "ICICI BANK"),
-            ("SBIN.NS", "SBI"), ("BHARTIARTL.NS", "AIRTEL"),
-            ("ITC.NS", "ITC"), ("LT.NS", "L&T")
-        ])
-
-    for t, n in assets: scan_market(t, n, "1d", "2y", "SWING")
-    for t, n in assets: scan_market(t, n, "1h", "1y", "INTRADAY")
-    for t, n in assets:
-        if ".NS" not in t: 
-            scan_market(t, n, "15m", "60d", "SCALPING")
+    for t, n in assets: 
+        scan_market(t, n, "1h", "1y", "INTRADAY")
 
 if __name__ == "__main__":
     main()
