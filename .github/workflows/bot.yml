@@ -2,7 +2,7 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Har 30 minute mein chalega
+    - cron: '*/15 * * * *'  # Har 30 minute mein chalega
   workflow_dispatch:        # Manually chalane ke liye button
 
 jobs:
