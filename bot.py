@@ -4,18 +4,19 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# GitHub Secrets se Token aur Chat ID uthayega
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Secrets missing! Setup incomplete.")
+        print("GALTI: Secrets missing!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=payload)
+        response = requests.post(url, data=payload)
+        # YEH LINE ERROR BATAYEGI
+        print(f"CHECK STATUS: {response.status_code} | MESSAGE: {response.text}")
     except Exception as e:
         print(f"Telegram Error: {e}")
 
@@ -78,6 +79,9 @@ def scan_market(ticker, name, interval, period, style):
 
 def main():
     print("Market Scan ho rahi hai...")
+    # Test message bhejenge taaki pata chale connection sahi hai
+    send_telegram_alert("🤖 Bot Start Ho Gaya Hai! Market scan kar raha hoon...")
+    
     coins = [
         ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM"), ("SOL-USD", "SOLANA"), 
         ("XRP-USD", "RIPPLE (XRP)"), ("BNB-USD", "BINANCE (BNB)"), 
