@@ -18,12 +18,10 @@ jobs:
           python-version: '3.10'
       
       - name: Install dependencies
-        run: pip install yfinance requests pandas pybit
+        run: pip install yfinance requests pandas
       
       - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
-          BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
         run: python bot.py
