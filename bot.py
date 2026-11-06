@@ -13,18 +13,6 @@ RISK_PER_TRADE = 1000
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY')
 
-# Client ko pehle None set karo
-client = None 
-
-try:
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        print("Bhai, API keys GitHub Secrets mein nahi mili!")
-    else:
-        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
-        print("Binance Client Connected Successfully!")
-except Exception as e:
-    print(f"Binance Connection Error: {e}")
-
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -33,13 +21,23 @@ def send_telegram_alert(message):
         requests.post(url, data=payload)
     except Exception: pass
 
+# --- BINANCE CONNECTION TEST ---
+client = None
+try:
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        raise Exception("API Keys GitHub Secrets mein nahi mili! (Name check karo)")
+    else:
+        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
+        send_telegram_alert("✅ Binance Testnet Connection Successful!")
+except Exception as e:
+    send_telegram_alert(f"⚠️ Binance Connection FAILED!\nReason: {e}")
+
 def check_wallet():
-    if client is None: return # Agar client nahi hai toh return karo
+    if client is None: return
     try:
         account = client.get_account()
         total_usdt_value = 0.0
         wallet_msg = "💼 **WALLET UPDATE** 💼\n\n"
-        
         for balance in account['balances']:
             asset = balance['asset']
             free = float(balance['free'])
@@ -56,23 +54,19 @@ def check_wallet():
                         wallet_msg += f"🪙 {asset}: {round(free, 4)} (≈ ${round(value_in_usdt, 2)})\n"
                     except:
                         wallet_msg += f"🪙 {asset}: {round(free, 4)}\n"
-        
         profit_loss = total_usdt_value - 10000
         wallet_msg += f"\n📊 **Total Value:** ≈ ${round(total_usdt_value, 2)}\n"
         if profit_loss >= 0:
             wallet_msg += f"🟢 **Total P&L:** +${round(profit_loss, 2)}"
         else:
             wallet_msg += f"🔴 **Total P&L:** -${round(abs(profit_loss), 2)}"
-            
         send_telegram_alert(wallet_msg)
     except Exception as e:
-        print(f"Wallet check error: {e}")
+        send_telegram_alert(f"⚠️ Wallet check error: {e}")
 
 def place_binance_order(symbol, side):
-    # Yahan check lagaya hai
     if client is None:
-        return "❌ Order Failed: Binance connect nahi hai (Check Keys)"
-        
+        return "❌ Order Failed: Binance connect nahi hai"
     try:
         if side == "BUY":
             order = client.order_market_buy(symbol=symbol, quantity=0.001)
@@ -151,10 +145,8 @@ def scan_market(ticker, name, interval, period, style):
         pass 
 
 def main():
-    print("Bot Started...")
-    check_wallet() # Wallet check karega
+    check_wallet() 
     
-    # ... (baaki assets list aur scan logic same rahega)
     utc_now = datetime.datetime.utcnow()
     ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
     is_indian_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
