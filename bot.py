@@ -3,15 +3,15 @@ import requests
 import os
 import warnings
 import datetime
-from binance.client import Client
+from pybit.unified_trading import HTTP
 warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 RISK_PER_TRADE = 1000 
 
-BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
-BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY')
+BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
+BYBIT_SECRET_KEY = os.environ.get('BYBIT_SECRET_KEY')
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
@@ -21,62 +21,50 @@ def send_telegram_alert(message):
         requests.post(url, data=payload)
     except Exception: pass
 
-# --- BINANCE CONNECTION TEST ---
-client = None
+# --- BYBIT TESTNET CONNECTION ---
+session = None
 try:
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        raise Exception("API Keys GitHub Secrets mein nahi mili! (Name check karo)")
+    if not BYBIT_API_KEY or not BYBIT_SECRET_KEY:
+        raise Exception("API Keys missing in GitHub Secrets!")
     else:
-        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
-        send_telegram_alert("✅ Binance Testnet Connection Successful!")
+        session = HTTP(testnet=True, api_key=BYBIT_API_KEY, api_secret=BYBIT_SECRET_KEY)
+        send_telegram_alert("✅ Bybit Testnet Connected Successfully!")
 except Exception as e:
-    send_telegram_alert(f"⚠️ Binance Connection FAILED!\nReason: {e}")
+    send_telegram_alert(f"⚠️ Bybit Connection FAILED!\nReason: {e}")
 
 def check_wallet():
-    if client is None: return
+    if session is None: return
     try:
-        account = client.get_account()
-        total_usdt_value = 0.0
-        wallet_msg = "💼 **WALLET UPDATE** 💼\n\n"
-        for balance in account['balances']:
-            asset = balance['asset']
-            free = float(balance['free'])
-            if free > 0:
-                if asset == "USDT":
-                    total_usdt_value += free
-                    wallet_msg += f"💰 {asset}: {round(free, 2)}\n"
-                else:
-                    try:
-                        ticker = client.get_symbol_ticker(symbol=f"{asset}USDT")
-                        price = float(ticker['price'])
-                        value_in_usdt = free * price
-                        total_usdt_value += value_in_usdt
-                        wallet_msg += f"🪙 {asset}: {round(free, 4)} (≈ ${round(value_in_usdt, 2)})\n"
-                    except:
-                        wallet_msg += f"🪙 {asset}: {round(free, 4)}\n"
-        profit_loss = total_usdt_value - 10000
-        wallet_msg += f"\n📊 **Total Value:** ≈ ${round(total_usdt_value, 2)}\n"
-        if profit_loss >= 0:
-            wallet_msg += f"🟢 **Total P&L:** +${round(profit_loss, 2)}"
-        else:
-            wallet_msg += f"🔴 **Total P&L:** -${round(abs(profit_loss), 2)}"
-        send_telegram_alert(wallet_msg)
+        response = session.get_wallet_balance(accountType="UNIFIED")
+        wallet_msg = "💼 **BYBIT WALLET UPDATE** 💼\n\n"
+        
+        if 'result' in response and 'list' in response['result']:
+            coins = response['result']['list'][0].get('coin', [])
+            total_usd = 0.0
+            for coin in coins:
+                if float(coin.get('walletBalance', 0)) > 0:
+                    wallet_msg += f"🪙 {coin['coin']}: {round(float(coin['walletBalance']), 4)} (${round(float(coin.get('usdValue', 0)), 2)})\n"
+                    total_usd += float(coin.get('usdValue', 0))
+            wallet_msg += f"\n📊 **Total Value:** ≈ ${round(total_usd, 2)}"
+            send_telegram_alert(wallet_msg)
     except Exception as e:
-        send_telegram_alert(f"⚠️ Wallet check error: {e}")
+        pass
 
-def place_binance_order(symbol, side):
-    if client is None:
-        return "❌ Order Failed: Binance connect nahi hai"
+def place_bybit_order(symbol, side):
+    if session is None: return "❌ Order Failed: Bybit connect nahi hai"
     try:
-        if side == "BUY":
-            order = client.order_market_buy(symbol=symbol, quantity=0.001)
-            return f"✅ TESTNET BUY Success! ID: {order['orderId']}"
-        elif side == "SELL":
-            order = client.order_market_sell(symbol=symbol, quantity=0.001)
-            return f"✅ TESTNET SELL Success! ID: {order['orderId']}"
+        bybit_side = "Buy" if side == "BUY" else "Sell"
+        
+        order = session.place_order(
+            category="spot",
+            symbol=symbol,
+            side=bybit_side,
+            orderType="Market",
+            qty="0.001" # Test quantity
+        )
+        return f"✅ TESTNET {side} Success! ID: {order['result']['orderId']}"
     except Exception as e:
         return f"❌ Order Failed: {e}"
-    return ""
 
 def scan_market(ticker, name, interval, period, style):
     try:
@@ -123,8 +111,8 @@ def scan_market(ticker, name, interval, period, style):
                 tp = round(price + (atr * 3.0), 2)
                 order_status = ""
                 if ".NS" not in ticker and ticker != "GC=F":
-                    binance_symbol = ticker.replace("-USD", "USDT")
-                    order_status = place_binance_order(binance_symbol, "BUY")
+                    bybit_symbol = ticker.replace("-USD", "USDT")
+                    order_status = place_bybit_order(bybit_symbol, "BUY")
                 
                 msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
@@ -135,8 +123,8 @@ def scan_market(ticker, name, interval, period, style):
                 tp = round(price - (atr * 3.0), 2)
                 order_status = ""
                 if ".NS" not in ticker and ticker != "GC=F":
-                    binance_symbol = ticker.replace("-USD", "USDT")
-                    order_status = place_binance_order(binance_symbol, "SELL")
+                    bybit_symbol = ticker.replace("-USD", "USDT")
+                    order_status = place_bybit_order(bybit_symbol, "SELL")
                 
                 msg = f"🔴 SELL SIGNAL 🔴\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
