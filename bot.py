@@ -10,15 +10,13 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 RISK_PER_TRADE = 1000 
 
-# --- BINANCE TESTNET CONNECTION ---
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY')
 
 try:
-    # testnet=True ka matlab fake money use ho raha hai
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
 except Exception as e:
-    print("Binance connection failed. Check API keys.")
+    print("Binance connection failed.")
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
@@ -28,19 +26,55 @@ def send_telegram_alert(message):
         requests.post(url, data=payload)
     except Exception: pass
 
+# 1. WALLET CHECKER FUNCTION
+def check_wallet():
+    try:
+        account = client.get_account()
+        total_usdt_value = 0.0
+        wallet_msg = "💼 **WALLET UPDATE** 💼\n\n"
+        
+        for balance in account['balances']:
+            asset = balance['asset']
+            free = float(balance['free'])
+            if free > 0:
+                if asset == "USDT":
+                    total_usdt_value += free
+                    wallet_msg += f"💰 {asset}: {round(free, 2)}\n"
+                else:
+                    try:
+                        ticker = client.get_symbol_ticker(symbol=f"{asset}USDT")
+                        price = float(ticker['price'])
+                        value_in_usdt = free * price
+                        total_usdt_value += value_in_usdt
+                        wallet_msg += f"🪙 {asset}: {round(free, 4)} (≈ ${round(value_in_usdt, 2)})\n"
+                    except:
+                        wallet_msg += f"🪙 {asset}: {round(free, 4)}\n"
+        
+        profit_loss = total_usdt_value - 10000
+        wallet_msg += f"\n📊 **Total Value:** ≈ ${round(total_usdt_value, 2)}\n"
+        if profit_loss >= 0:
+            wallet_msg += f"🟢 **Total P&L:** +${round(profit_loss, 2)}"
+        else:
+            wallet_msg += f"🔴 **Total P&L:** -${round(abs(profit_loss), 2)}"
+            
+        send_telegram_alert(wallet_msg)
+    except Exception as e:
+        print(f"Wallet check error: {e}")
+
+# 2. ORDER PLACEMENT FUNCTION
 def place_binance_order(symbol, side):
     try:
-        # Test ke liye 0.001 BTC/ETH kharid/bech rahe hain
         if side == "BUY":
             order = client.order_market_buy(symbol=symbol, quantity=0.001)
-            return f"✅ TESTNET BUY Order Success! ID: {order['orderId']}"
+            return f"✅ TESTNET BUY Success! ID: {order['orderId']}"
         elif side == "SELL":
             order = client.order_market_sell(symbol=symbol, quantity=0.001)
-            return f"✅ TESTNET SELL Order Success! ID: {order['orderId']}"
+            return f"✅ TESTNET SELL Success! ID: {order['orderId']}"
     except Exception as e:
         return f"❌ Order Failed: {e}"
     return ""
 
+# 3. MARKET SCANNER FUNCTION
 def scan_market(ticker, name, interval, period, style):
     try:
         d = yf.download(ticker, period=period, interval=interval, progress=False).dropna()
@@ -77,18 +111,15 @@ def scan_market(ticker, name, interval, period, style):
         
         recent_high = high.tail(30).max()
         recent_low = low.tail(30).min()
-        
         near_resistance = price >= (recent_high * 0.995)
         near_support = price <= (recent_low * 1.005)
 
-        # --- STRICT BUY LOGIC ---
+        # BUY LOGIC
         if ema9 > ema21 and price > ema200 and macd_bullish and rsi < 70 and vol_ratio >= 0.5:
             if not near_resistance:
                 sl = round(price - (atr * 1.5), 2)
                 tp = round(price + (atr * 3.0), 2)
-                
                 order_status = ""
-                # Sirf Crypto ke liye Testnet order lagayega (Stocks/Gold nahi)
                 if ".NS" not in ticker and ticker != "GC=F":
                     binance_symbol = ticker.replace("-USD", "USDT")
                     order_status = place_binance_order(binance_symbol, "BUY")
@@ -96,12 +127,11 @@ def scan_market(ticker, name, interval, period, style):
                 msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
             
-        # --- STRICT SELL LOGIC ---
+        # SELL LOGIC
         elif ema9 < ema21 and price < ema200 and not macd_bullish and vol_ratio >= 0.5:
             if not (near_support and rsi < 35) and rsi > 30:
                 sl = round(price + (atr * 1.5), 2)
                 tp = round(price - (atr * 3.0), 2)
-                
                 order_status = ""
                 if ".NS" not in ticker and ticker != "GC=F":
                     binance_symbol = ticker.replace("-USD", "USDT")
@@ -114,13 +144,36 @@ def scan_market(ticker, name, interval, period, style):
         pass 
 
 def main():
-    send_telegram_alert("🤖 Bot Testnet Mode ON! Auto-Order Test shuru...")
+    print("Bot Started...")
     
-    # Test ke liye sirf BTC aur ETH rakha hai taaki test jaldi ho
-    assets = [("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM")]
+    # Check Wallet Status first
+    check_wallet()
     
-    for t, n in assets: 
-        scan_market(t, n, "1h", "1y", "INTRADAY")
+    utc_now = datetime.datetime.utcnow()
+    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
+    is_indian_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
+
+    assets = [
+        ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM"), ("SOL-USD", "SOLANA"), 
+        ("XRP-USD", "RIPPLE (XRP)"), ("BNB-USD", "BINANCE COIN"), ("DOGE-USD", "DOGECOIN"),
+        ("ADA-USD", "CARDANO"), ("MATIC-USD", "POLYGON"), ("DOT-USD", "POLKADOT"),
+        ("AVAX-USD", "AVALANCHE"), ("LINK-USD", "CHAINLINK"), ("GC=F", "GOLD")
+    ]
+    
+    if is_indian_market_open:
+        assets.extend([
+            ("RELIANCE.NS", "RELIANCE"), ("TATAMOTORS.NS", "TATA MOTORS"),
+            ("HDFCBANK.NS", "HDFC BANK"), ("INFY.NS", "INFOSYS"),
+            ("TCS.NS", "TCS"), ("ICICIBANK.NS", "ICICI BANK"),
+            ("SBIN.NS", "SBI"), ("BHARTIARTL.NS", "AIRTEL"),
+            ("ITC.NS", "ITC"), ("LT.NS", "L&T")
+        ])
+
+    for t, n in assets: scan_market(t, n, "1d", "2y", "SWING")
+    for t, n in assets: scan_market(t, n, "1h", "1y", "INTRADAY")
+    for t, n in assets:
+        if ".NS" not in t: 
+            scan_market(t, n, "15m", "60d", "SCALPING")
 
 if __name__ == "__main__":
     main()
