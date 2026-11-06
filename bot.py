@@ -13,10 +13,17 @@ RISK_PER_TRADE = 1000
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY')
 
+# Client ko pehle None set karo
+client = None 
+
 try:
-    client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
+    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+        print("Bhai, API keys GitHub Secrets mein nahi mili!")
+    else:
+        client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=True)
+        print("Binance Client Connected Successfully!")
 except Exception as e:
-    print("Binance connection failed.")
+    print(f"Binance Connection Error: {e}")
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
@@ -26,8 +33,8 @@ def send_telegram_alert(message):
         requests.post(url, data=payload)
     except Exception: pass
 
-# 1. WALLET CHECKER FUNCTION
 def check_wallet():
+    if client is None: return # Agar client nahi hai toh return karo
     try:
         account = client.get_account()
         total_usdt_value = 0.0
@@ -61,8 +68,11 @@ def check_wallet():
     except Exception as e:
         print(f"Wallet check error: {e}")
 
-# 2. ORDER PLACEMENT FUNCTION
 def place_binance_order(symbol, side):
+    # Yahan check lagaya hai
+    if client is None:
+        return "❌ Order Failed: Binance connect nahi hai (Check Keys)"
+        
     try:
         if side == "BUY":
             order = client.order_market_buy(symbol=symbol, quantity=0.001)
@@ -74,7 +84,6 @@ def place_binance_order(symbol, side):
         return f"❌ Order Failed: {e}"
     return ""
 
-# 3. MARKET SCANNER FUNCTION
 def scan_market(ticker, name, interval, period, style):
     try:
         d = yf.download(ticker, period=period, interval=interval, progress=False).dropna()
@@ -114,7 +123,6 @@ def scan_market(ticker, name, interval, period, style):
         near_resistance = price >= (recent_high * 0.995)
         near_support = price <= (recent_low * 1.005)
 
-        # BUY LOGIC
         if ema9 > ema21 and price > ema200 and macd_bullish and rsi < 70 and vol_ratio >= 0.5:
             if not near_resistance:
                 sl = round(price - (atr * 1.5), 2)
@@ -127,7 +135,6 @@ def scan_market(ticker, name, interval, period, style):
                 msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\n{order_status}\n🛑 SL: {sl} | 🎯 TP: {tp}"
                 send_telegram_alert(msg) 
             
-        # SELL LOGIC
         elif ema9 < ema21 and price < ema200 and not macd_bullish and vol_ratio >= 0.5:
             if not (near_support and rsi < 35) and rsi > 30:
                 sl = round(price + (atr * 1.5), 2)
@@ -145,10 +152,9 @@ def scan_market(ticker, name, interval, period, style):
 
 def main():
     print("Bot Started...")
+    check_wallet() # Wallet check karega
     
-    # Check Wallet Status first
-    check_wallet()
-    
+    # ... (baaki assets list aur scan logic same rahega)
     utc_now = datetime.datetime.utcnow()
     ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
     is_indian_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
@@ -159,7 +165,6 @@ def main():
         ("ADA-USD", "CARDANO"), ("MATIC-USD", "POLYGON"), ("DOT-USD", "POLKADOT"),
         ("AVAX-USD", "AVALANCHE"), ("LINK-USD", "CHAINLINK"), ("GC=F", "GOLD")
     ]
-    
     if is_indian_market_open:
         assets.extend([
             ("RELIANCE.NS", "RELIANCE"), ("TATAMOTORS.NS", "TATA MOTORS"),
