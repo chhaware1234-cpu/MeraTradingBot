@@ -7,7 +7,13 @@ warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
-RISK_PER_TRADE = 1000 
+
+# ========================================================
+# 💰 AAPKE ACCOUNT KI SETTINGS 
+# ========================================================
+SPOT_CAPITAL = 20      # Spot trade mein $20 lagayenge
+FUTURES_MARGIN = 50    # Futures mein $50 margin
+LEVERAGE = 10          # 10x Leverage
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
@@ -45,21 +51,22 @@ def scan_market(ticker, name, interval, period, style):
         tr = high - low
         atr = tr.rolling(14).mean().iloc[-1]
         
-        price = round(float(close.iloc[-1]), 2)
+        price = round(float(close.iloc[-1]), 4)
         rsi = round(float(rsi), 1)
 
-        # --- VOLUME & FAKE PUMP DETECTOR ---
+        # --- VOLUME & S/R FILTERS ---
         current_vol = volume.iloc[-1]
         avg_vol = volume.rolling(20).mean().iloc[-1]
         vol_ratio = current_vol / avg_vol if avg_vol != 0 else 1
         
-        # --- SUPPORT & RESISTANCE ---
         recent_high = high.tail(30).max()
         recent_low = low.tail(30).min()
-        near_resistance = price >= (recent_high * 0.995) # 0.5% ke andar
-        near_support = price <= (recent_low * 1.005)
+        
+        sr_margin = 0.998 if (".NS" in ticker or ticker == "GC=F") else 0.995
+        near_resistance = price >= (recent_high * sr_margin)
+        near_support = price <= (recent_low * (2 - sr_margin))
 
-        # --- CANDLE PATTERNS ---
+        # --- CANDLE PATTERN ---
         c_open, c_close = open_p.iloc[-1], close.iloc[-1]
         p_open, p_close = open_p.iloc[-2], close.iloc[-2]
         bull_engulf = (c_close > c_open) and (p_close < p_open) and (c_close > p_open) and (c_open < p_close)
@@ -70,35 +77,55 @@ def scan_market(ticker, name, interval, period, style):
         if ema9 > ema21 and price > ema200 and macd_bullish and rsi < 70 and vol_ratio >= 0.5:
             if not near_resistance:
                 strength = "STRONG 🔥" if (bull_engulf and vol_ratio > 1.5) else "GOOD 👍"
-                sl = round(price - (atr * 1.5), 2)
-                tp = round(price + (atr * 3.0), 2)
-                sl_dist = abs(price - sl)
-                qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
+                sl = round(price - (atr * 1.5), 4)
+                tp = round(price + (atr * 3.0), 4)
                 
-                msg = f"🟢 BUY SIGNAL 🟢\nAsset: {name} ({style})\nPrice: {price}\nQty: {qty} (Risk: ₹{RISK_PER_TRADE})\nStrength: {strength} {candle_msg}\n🛑 SL: {sl} | 🎯 TP: {tp}"
+                spot_qty = round(SPOT_CAPITAL / price, 4)
+                fut_qty = round((FUTURES_MARGIN * LEVERAGE) / price, 4)
+                
+                msg = (f"🟢 BUY SIGNAL 🟢\n"
+                       f"Asset: {name} ({style})\n"
+                       f"Price: {price}\n"
+                       f"Strength: {strength} {candle_msg}\n"
+                       f"🛑 SL: {sl} | 🎯 TP: {tp}\n\n"
+                       f"🛡️ **SPOT TRADING (Hold)**\n"
+                       f"Qty: {spot_qty} (Capital: ~${SPOT_CAPITAL})\n\n"
+                       f"🚀 **FUTURES TRADING (Long)**\n"
+                       f"Qty: {fut_qty} (Margin: ${FUTURES_MARGIN} @ {LEVERAGE}x)")
+                
                 send_telegram_alert(msg) 
             
         # --- SELL LOGIC ---
         elif ema9 < ema21 and price < ema200 and not macd_bullish and vol_ratio >= 0.5:
             if not (near_support and rsi < 35) and rsi > 30:
                 strength = "STRONG 🔥" if (bear_engulf and vol_ratio > 1.5) else "GOOD 👍"
-                sl = round(price + (atr * 1.5), 2)
-                tp = round(price - (atr * 3.0), 2)
-                sl_dist = abs(sl - price)
-                qty = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0
+                sl = round(price + (atr * 1.5), 4)
+                tp = round(price - (atr * 3.0), 4)
                 
-                msg = f"🔴 SELL SIGNAL 🔴\nAsset: {name} ({style})\nPrice: {price}\nQty: {qty} (Risk: ₹{RISK_PER_TRADE})\nStrength: {strength} {candle_msg}\n🛑 SL: {sl} | 🎯 TP: {tp}"
+                fut_qty = round((FUTURES_MARGIN * LEVERAGE) / price, 4)
+                
+                msg = (f"🔴 SELL SIGNAL 🔴\n"
+                       f"Asset: {name} ({style})\n"
+                       f"Price: {price}\n"
+                       f"Strength: {strength} {candle_msg}\n"
+                       f"🛑 SL: {sl} | 🎯 TP: {tp}\n\n"
+                       f"🚀 **FUTURES TRADING (Short)**\n"
+                       f"Qty: {fut_qty} (Margin: ${FUTURES_MARGIN} @ {LEVERAGE}x)\n\n"
+                       f"*(Spot mein Short nahi hota)*")
+                
                 send_telegram_alert(msg) 
                 
     except Exception as e:
         pass 
 
 def main():
-    send_telegram_alert("🤖 Supreme Bot scan kar raha hai... (Crypto, Gold, Stocks)")
+    send_telegram_alert("🤖 Dual-Bot (Spot + Futures) scan shuru...")
     
     utc_now = datetime.datetime.utcnow()
     ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
-    is_indian_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
+    
+    is_weekday = ist_now.weekday() < 5
+    is_indian_market_open = is_weekday and (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
 
     assets = [
         ("BTC-USD", "BITCOIN"), ("ETH-USD", "ETHEREUM"), ("SOL-USD", "SOLANA"), 
@@ -116,8 +143,11 @@ def main():
             ("ITC.NS", "ITC"), ("LT.NS", "L&T")
         ])
 
+    # 1. Swing (Daily)
     for t, n in assets: scan_market(t, n, "1d", "2y", "SWING")
+    # 2. Intraday (1-Hour)
     for t, n in assets: scan_market(t, n, "1h", "1y", "INTRADAY")
+    # 3. Scalping (15-min)
     for t, n in assets:
         if ".NS" not in t: 
             scan_market(t, n, "15m", "60d", "SCALPING")
