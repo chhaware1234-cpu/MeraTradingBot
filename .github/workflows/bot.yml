@@ -2,7 +2,7 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Ab har 30 minute mein chalega
+    - cron: '*/30 * * * *'  # Har 30 minute mein chalega
   workflow_dispatch:
 
 jobs:
@@ -18,12 +18,12 @@ jobs:
           python-version: '3.10'
       
       - name: Install dependencies
-        run: pip install yfinance requests pandas python-binance
+        run: pip install yfinance requests pandas pybit
       
       - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_SECRET_KEY: ${{ secrets.BYBIT_SECRET_KEY }}
         run: python bot.py
