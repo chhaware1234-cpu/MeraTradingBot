@@ -18,12 +18,20 @@ COOLDOWN_HOURS = 2 # Cooldown 4 se 2 ghante kiya
 COOLDOWN_FILE = "cooldown.json"
 
 def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("❌ GALTI: Telegram Token ya Chat ID nahi mili!")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, data=payload)
-    except Exception: pass
+        response = requests.post(url, data=payload)
+        # Agar Telegram error de raha hai, toh yahan print hoga
+        if response.status_code != 200:
+            print(f"❌ TELEGRAM ERROR: {response.text}")
+        else:
+            print("✅ Telegram Message Sent Successfully!")
+    except Exception as e:
+        print(f"❌ CONNECTION ERROR: {e}")
 
 def load_cooldown():
     if os.path.exists(COOLDOWN_FILE):
