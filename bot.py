@@ -4,16 +4,17 @@ import os
 import warnings
 import datetime
 import json
-import pandas as pd
+import time
 warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 # ==========================================
-# ⚙️ SETTINGS
+# ⚙️ SETTINGS (Aapke hisaab se change kiya gaya)
 # ==========================================
-MIN_SCORE = 80
+MIN_SCORE = 60  # Score 80 se kam karke 60 kiya
+COOLDOWN_HOURS = 2 # Cooldown 4 se 2 ghante kiya
 COOLDOWN_FILE = "cooldown.json"
 
 def send_telegram_alert(message):
@@ -43,46 +44,63 @@ def check_candle_pattern(open_p, close, high, low):
     upper_wick = c_high - max(c_close, c_open)
     lower_wick = min(c_close, c_open) - c_low
     
-    # 1. Bullish Engulfing
     if (c_close > c_open) and (p_close < p_open) and (c_close > p_open) and (c_open < p_close):
         return "Bullish Engulfing", "BUY"
-    # 2. Bearish Engulfing
     if (c_close < c_open) and (p_close > p_open) and (c_close < p_open) and (c_open > p_close):
         return "Bearish Engulfing", "SELL"
-    # 3. Hammer (Bullish)
     if lower_wick > 2 * body and upper_wick < body:
         return "Hammer", "BUY"
-    # 4. Shooting Star (Bearish)
     if upper_wick > 2 * body and lower_wick < body:
         return "Shooting Star", "SELL"
-    
     return "None", None
 
 def analyze_market():
+    # Start Message
+    send_telegram_alert("🤖 <b>Supreme Bot Scan shuru...</b>\nMarket ka analysis kiya ja raha hai.")
+    
     cooldown_data = load_cooldown()
     now = datetime.datetime.now()
     
-    # 🚨 1. BTC MARKET REGIME CHECK
+    # Indian Market Time Check (9:15 AM to 3:30 PM IST)
+    utc_now = datetime.datetime.utcnow()
+    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
+    is_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
+
+    # 🚨 BTC MARKET REGIME
     btc = yf.download("BTC-USD", period="1mo", interval="1h", progress=False).dropna()
     btc_ema9 = btc["Close"].ewm(span=9).mean().iloc[-1]
     btc_ema21 = btc["Close"].ewm(span=21).mean().iloc[-1]
-    btc_bearish = btc_ema9 < btc_ema21 # Agar BTC bearish hai, toh alts mein BUY block
+    btc_bearish = btc_ema9 < btc_ema21 
     
+    # 15 Crypto Coins
     assets = [
         ("BTC-USD", "BITCOIN (BTC)"), ("ETH-USD", "ETHEREUM (ETH)"), 
         ("SOL-USD", "SOLANA (SOL)"), ("ADA-USD", "CARDANO (ADA)"), 
-        ("XRP-USD", "RIPPLE (XRP)")
+        ("XRP-USD", "RIPPLE (XRP)"), ("BNB-USD", "BINANCE COIN (BNB)"), 
+        ("DOGE-USD", "DOGECOIN (DOGE)"), ("AVAX-USD", "AVALANCHE (AVAX)"), 
+        ("DOT-USD", "POLKADOT (DOT)"), ("MATIC-USD", "POLYGON (MATIC)"), 
+        ("LINK-USD", "CHAINLINK (LINK)"), ("LTC-USD", "LITECOIN (LTC)"), 
+        ("BCH-USD", "BITCOIN CASH (BCH)"), ("NEAR-USD", "NEAR PROTOCOL"), 
+        ("ATOM-USD", "COSMOS (ATOM)")
     ]
 
+    # 10 Indian Stocks (Sirf tab add honge jab market khula ho)
+    if is_market_open:
+        assets.extend([
+            ("RELIANCE.NS", "RELIANCE"), ("TCS.NS", "TCS"), 
+            ("HDFCBANK.NS", "HDFC BANK"), ("INFY.NS", "INFOSYS"), 
+            ("ICICIBANK.NS", "ICICI BANK"), ("SBIN.NS", "SBI"), 
+            ("BHARTIARTL.NS", "AIRTEL"), ("ITC.NS", "ITC"), 
+            ("LT.NS", "L&T"), ("TATAMOTORS.NS", "TATA MOTORS")
+        ])
+
     for ticker, name in assets:
-        # Cooldown Check (4 hours)
         if ticker in cooldown_data:
-            last_signal_time = datetime.datetime.strptime(cooldown_data[ticker], "%Y-%m-%d %H:%M:%S")
-            if (now - last_signal_time).total_seconds() < 4 * 3600:
-                continue # Skip if within 4 hours
+            last_signal = datetime.datetime.strptime(cooldown_data[ticker], "%Y-%m-%d %H:%M:%S")
+            if (now - last_signal).total_seconds() < COOLDOWN_HOURS * 3600:
+                continue
 
         try:
-            # Fetch 1H Data
             d = yf.download(ticker, period="1mo", interval="1h", progress=False).dropna()
             if len(d) < 100: continue
 
@@ -92,7 +110,6 @@ def analyze_market():
             low = d["Low"].squeeze()
             volume = d["Volume"].squeeze()
 
-            # Indicators
             ema9 = close.ewm(span=9).mean().iloc[-1]
             ema21 = close.ewm(span=21).mean().iloc[-1]
             ema200 = close.ewm(span=200).mean().iloc[-1]
@@ -106,106 +123,85 @@ def analyze_market():
             signal_line = macd_line.ewm(span=9).mean()
             macd_bullish = macd_line.iloc[-1] > signal_line.iloc[-1]
             
-            # RVOL & OBV
             avg_vol = volume.rolling(20).mean().iloc[-1]
             rvol = volume.iloc[-1] / avg_vol if avg_vol != 0 else 1
-            
             obv = (close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0)) * volume).cumsum()
-            obv_trend_up = obv.iloc[-1] > obv.iloc[-5]
+            obv_up = obv.iloc[-1] > obv.iloc[-5]
             
             price = round(float(close.iloc[-1]), 4)
-            
-            # S/R (Support & Resistance)
             recent_high = high.tail(30).max()
             recent_low = low.tail(30).min()
             near_resistance = price >= (recent_high * 0.99)
             near_support = price <= (recent_low * 1.01)
+            pattern, pattern_sig = check_candle_pattern(open_p, close, high, low)
 
-            # Candle Pattern
-            pattern_name, pattern_signal = check_candle_pattern(open_p, close, high, low)
-
-            # ==========================================
-            # 🧮 SCORING SYSTEM
-            # ==========================================
+            # 🧮 SCORING SYSTEM (Flexible)
             buy_score = 0
             sell_score = 0
 
-            # 1. Trend (30 Points)
             if ema9 > ema21 and price > ema200: buy_score += 30
             if ema9 < ema21 and price < ema200: sell_score += 30
             
-            # 2. Momentum (25 Points)
-            if 40 <= rsi <= 65 and macd_bullish: buy_score += 25
-            if 35 <= rsi <= 60 and not macd_bullish: sell_score += 25
+            if 35 <= rsi <= 70 and macd_bullish: buy_score += 25
+            if 30 <= rsi <= 65 and not macd_bullish: sell_score += 25
             
-            # 3. Volume & Pump Filter (15 Points)
-            if rvol > 1.2: # Volume should be above average
-                if obv_trend_up: buy_score += 15
-                if not obv_trend_up: sell_score += 15
+            if rvol >= 1.0: # Normal volume is fine now
+                if obv_up: buy_score += 15
+                if not obv_up: sell_score += 15
             
-            # 4. S/R Confirmation (15 Points)
             if near_support and not near_resistance: buy_score += 15
             if near_resistance and not near_support: sell_score += 15
 
-            # 5. Candle Confirmation (15 Points)
-            if pattern_signal == "BUY": buy_score += 15
-            if pattern_signal == "SELL": sell_score += 15
+            if pattern_sig == "BUY": buy_score += 15
+            if pattern_sig == "SELL": sell_score += 15
 
-            # ==========================================
             # 🚀 SIGNAL GENERATION
-            # ==========================================
-            # BUY SIGNAL
             if buy_score >= MIN_SCORE:
-                if btc_bearish and ticker != "BTC-USD":
-                    continue # Block Alt BUY if BTC is bearish
+                if btc_bearish and ticker != "BTC-USD" and ".NS" not in ticker:
+                    continue 
                 
-                sl = round(price - (price * 0.015), 4) # 1.5% SL
-                tp = round(price + (price * 0.03), 4)  # 3% TP
-                qty = round((50 * 10) / price, 2)
+                sl = round(price - (price * 0.015), 4)
+                tp = round(price + (price * 0.03), 4)
+                qty = round((50 * 10) / price, 2) if ".NS" not in ticker else 0
                 
                 msg = f"""🟢 <b>BUY SIGNAL (LONG)</b> 🟢
 ━━━━━━━━━━━━━━━━━━━━
 🪙 <b>Asset:</b> {name}
 ⏱ <b>Type:</b> INTRADAY (1h)
 
-💰 <b>Current Price:</b> {price}
-🛑 <b>Stop Loss:</b> {sl}
-🎯 <b>Take Profit:</b> {tp}
-
+💰 <b>Price:</b> {price}
+🛑 <b>SL:</b> {sl}
+🎯 <b>TP:</b> {tp}
 📊 <b>Score:</b> {buy_score}/100 🏆
-🚀 <b>FUTURES (Long):</b> Qty {qty} (Margin: $50)
 
-📈 <b>Technicals</b>
-Trend: UP | RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x
-Candle: {pattern_name} 🕯️"""
+🚀 <b>Qty:</b> {qty} (Margin: $50)
+📈 RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x | {pattern}"""
                 send_telegram_alert(msg)
                 cooldown_data[ticker] = now.strftime("%Y-%m-%d %H:%M:%S")
                 save_cooldown(cooldown_data)
 
-            # SELL SIGNAL
             elif sell_score >= MIN_SCORE:
                 sl = round(price + (price * 0.015), 4) 
                 tp = round(price - (price * 0.03), 4)
-                qty = round((50 * 10) / price, 2)
+                qty = round((50 * 10) / price, 2) if ".NS" not in ticker else 0
                 
                 msg = f"""🔴 <b>SELL SIGNAL (SHORT)</b> 🔴
 ━━━━━━━━━━━━━━━━━━━━
 🪙 <b>Asset:</b> {name}
 ⏱ <b>Type:</b> INTRADAY (1h)
 
-💰 <b>Current Price:</b> {price}
-🛑 <b>Stop Loss:</b> {sl}
-🎯 <b>Take Profit:</b> {tp}
-
+💰 <b>Price:</b> {price}
+🛑 <b>SL:</b> {sl}
+🎯 <b>TP:</b> {tp}
 📊 <b>Score:</b> {sell_score}/100 🏆
-🚀 <b>FUTURES (Short):</b> Qty {qty} (Margin: $50)
 
-📈 <b>Technicals</b>
-Trend: DOWN | RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x
-Candle: {pattern_name} 🕯️"""
+🚀 <b>Qty:</b> {qty} (Margin: $50)
+📈 RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x | {pattern}"""
                 send_telegram_alert(msg)
                 cooldown_data[ticker] = now.strftime("%Y-%m-%d %H:%M:%S")
                 save_cooldown(cooldown_data)
+            
+            time.sleep(1) # API limit se bachne ke liye
 
         except Exception as e:
             pass
