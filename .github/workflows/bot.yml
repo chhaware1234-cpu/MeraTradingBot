@@ -2,7 +2,7 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Har 30 minute mein chalega
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,14 +20,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       
-      # Cooldown file ko save aur restore karne ke liye cache
       - name: Cache Cooldown File
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: cooldown.json
           key: cooldown-cache-${{ github.run_id }}
-          restore-keys: |
-            cooldown-cache-
+          restore-keys: cooldown-cache-
       
       - name: Run bot
         env:
