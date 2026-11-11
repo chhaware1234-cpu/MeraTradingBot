@@ -11,27 +11,20 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 # ==========================================
-# ⚙️ SETTINGS (Aapke hisaab se change kiya gaya)
+# ⚙️ SMART SETTINGS
 # ==========================================
-MIN_SCORE = 60  # Score 80 se kam karke 60 kiya
-COOLDOWN_HOURS = 2 # Cooldown 4 se 2 ghante kiya
+MIN_SCORE = 70  # Score wapas 70 kiya taaki fake signals kam aayein
+MAX_SIGNALS_PER_RUN = 2 # Ek baar mein sirf top 2 signals bhejega
+COOLDOWN_HOURS = 4 # 4 ghante tak wahi coin repeat nahi hoga
 COOLDOWN_FILE = "cooldown.json"
 
 def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ GALTI: Telegram Token ya Chat ID nahi mili!")
-        return
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        response = requests.post(url, data=payload)
-        # Agar Telegram error de raha hai, toh yahan print hoga
-        if response.status_code != 200:
-            print(f"❌ TELEGRAM ERROR: {response.text}")
-        else:
-            print("✅ Telegram Message Sent Successfully!")
-    except Exception as e:
-        print(f"❌ CONNECTION ERROR: {e}")
+        requests.post(url, data=payload)
+    except Exception: pass
 
 def load_cooldown():
     if os.path.exists(COOLDOWN_FILE):
@@ -63,44 +56,26 @@ def check_candle_pattern(open_p, close, high, low):
     return "None", None
 
 def analyze_market():
-    # Start Message
-    send_telegram_alert("🤖 <b>Supreme Bot Scan shuru...</b>\nMarket ka analysis kiya ja raha hai.")
-    
     cooldown_data = load_cooldown()
     now = datetime.datetime.now()
     
-    # Indian Market Time Check (9:15 AM to 3:30 PM IST)
-    utc_now = datetime.datetime.utcnow()
-    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
-    is_market_open = (9 <= ist_now.hour < 15) and not (ist_now.hour == 15 and ist_now.minute > 30)
-
-    # 🚨 BTC MARKET REGIME
+    # BTC Regime
     btc = yf.download("BTC-USD", period="1mo", interval="1h", progress=False).dropna()
     btc_ema9 = btc["Close"].ewm(span=9).mean().iloc[-1]
     btc_ema21 = btc["Close"].ewm(span=21).mean().iloc[-1]
     btc_bearish = btc_ema9 < btc_ema21 
     
-    # 15 Crypto Coins
     assets = [
         ("BTC-USD", "BITCOIN (BTC)"), ("ETH-USD", "ETHEREUM (ETH)"), 
         ("SOL-USD", "SOLANA (SOL)"), ("ADA-USD", "CARDANO (ADA)"), 
         ("XRP-USD", "RIPPLE (XRP)"), ("BNB-USD", "BINANCE COIN (BNB)"), 
         ("DOGE-USD", "DOGECOIN (DOGE)"), ("AVAX-USD", "AVALANCHE (AVAX)"), 
-        ("DOT-USD", "POLKADOT (DOT)"), ("MATIC-USD", "POLYGON (MATIC)"), 
-        ("LINK-USD", "CHAINLINK (LINK)"), ("LTC-USD", "LITECOIN (LTC)"), 
-        ("BCH-USD", "BITCOIN CASH (BCH)"), ("NEAR-USD", "NEAR PROTOCOL"), 
-        ("ATOM-USD", "COSMOS (ATOM)")
+        ("DOT-USD", "POLKADOT (DOT)"), ("LINK-USD", "CHAINLINK (LINK)"), 
+        ("LTC-USD", "LITECOIN (LTC)")
     ]
 
-    # 10 Indian Stocks (Sirf tab add honge jab market khula ho)
-    if is_market_open:
-        assets.extend([
-            ("RELIANCE.NS", "RELIANCE"), ("TCS.NS", "TCS"), 
-            ("HDFCBANK.NS", "HDFC BANK"), ("INFY.NS", "INFOSYS"), 
-            ("ICICIBANK.NS", "ICICI BANK"), ("SBIN.NS", "SBI"), 
-            ("BHARTIARTL.NS", "AIRTEL"), ("ITC.NS", "ITC"), 
-            ("LT.NS", "L&T"), ("TATAMOTORS.NS", "TATA MOTORS")
-        ])
+    # List to store all valid signals before sending
+    valid_signals = []
 
     for ticker, name in assets:
         if ticker in cooldown_data:
@@ -143,17 +118,16 @@ def analyze_market():
             near_support = price <= (recent_low * 1.01)
             pattern, pattern_sig = check_candle_pattern(open_p, close, high, low)
 
-            # 🧮 SCORING SYSTEM (Flexible)
             buy_score = 0
             sell_score = 0
 
             if ema9 > ema21 and price > ema200: buy_score += 30
             if ema9 < ema21 and price < ema200: sell_score += 30
             
-            if 35 <= rsi <= 70 and macd_bullish: buy_score += 25
-            if 30 <= rsi <= 65 and not macd_bullish: sell_score += 25
+            if 40 <= rsi <= 65 and macd_bullish: buy_score += 25
+            if 35 <= rsi <= 60 and not macd_bullish: sell_score += 25
             
-            if rvol >= 1.0: # Normal volume is fine now
+            if rvol >= 1.0: 
                 if obv_up: buy_score += 15
                 if not obv_up: sell_score += 15
             
@@ -163,56 +137,54 @@ def analyze_market():
             if pattern_sig == "BUY": buy_score += 15
             if pattern_sig == "SELL": sell_score += 15
 
-            # 🚀 SIGNAL GENERATION
             if buy_score >= MIN_SCORE:
-                if btc_bearish and ticker != "BTC-USD" and ".NS" not in ticker:
-                    continue 
-                
-                sl = round(price - (price * 0.015), 4)
-                tp = round(price + (price * 0.03), 4)
-                qty = round((50 * 10) / price, 2) if ".NS" not in ticker else 0
-                
-                msg = f"""🟢 <b>BUY SIGNAL (LONG)</b> 🟢
-━━━━━━━━━━━━━━━━━━━━
-🪙 <b>Asset:</b> {name}
-⏱ <b>Type:</b> INTRADAY (1h)
-
-💰 <b>Price:</b> {price}
-🛑 <b>SL:</b> {sl}
-🎯 <b>TP:</b> {tp}
-📊 <b>Score:</b> {buy_score}/100 🏆
-
-🚀 <b>Qty:</b> {qty} (Margin: $50)
-📈 RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x | {pattern}"""
-                send_telegram_alert(msg)
-                cooldown_data[ticker] = now.strftime("%Y-%m-%d %H:%M:%S")
-                save_cooldown(cooldown_data)
+                if not (btc_bearish and ticker != "BTC-USD"):
+                    valid_signals.append({
+                        "type": "BUY", "ticker": ticker, "name": name, "score": buy_score,
+                        "price": price, "rsi": rsi, "rvol": rvol, "pattern": pattern,
+                        "sl": round(price - (price * 0.015), 4), "tp": round(price + (price * 0.03), 4)
+                    })
 
             elif sell_score >= MIN_SCORE:
-                sl = round(price + (price * 0.015), 4) 
-                tp = round(price - (price * 0.03), 4)
-                qty = round((50 * 10) / price, 2) if ".NS" not in ticker else 0
-                
-                msg = f"""🔴 <b>SELL SIGNAL (SHORT)</b> 🔴
-━━━━━━━━━━━━━━━━━━━━
-🪙 <b>Asset:</b> {name}
-⏱ <b>Type:</b> INTRADAY (1h)
+                valid_signals.append({
+                    "type": "SELL", "ticker": ticker, "name": name, "score": sell_score,
+                    "price": price, "rsi": rsi, "rvol": rvol, "pattern": pattern,
+                    "sl": round(price + (price * 0.015), 4), "tp": round(price - (price * 0.03), 4)
+                })
 
-💰 <b>Price:</b> {price}
-🛑 <b>SL:</b> {sl}
-🎯 <b>TP:</b> {tp}
-📊 <b>Score:</b> {sell_score}/100 🏆
-
-🚀 <b>Qty:</b> {qty} (Margin: $50)
-📈 RSI: {round(float(rsi),1)} | Vol: {round(float(rvol),1)}x | {pattern}"""
-                send_telegram_alert(msg)
-                cooldown_data[ticker] = now.strftime("%Y-%m-%d %H:%M:%S")
-                save_cooldown(cooldown_data)
-            
-            time.sleep(1) # API limit se bachne ke liye
+            time.sleep(0.5) # API limit
 
         except Exception as e:
             pass
+
+    # Sort signals by highest score and send TOP 2 ONLY
+    valid_signals.sort(key=lambda x: x['score'], reverse=True)
+    top_signals = valid_signals[:MAX_SIGNALS_PER_RUN]
+
+    if not top_signals:
+        print("No high-quality signals found in this run.")
+        return
+
+    for sig in top_signals:
+        emoji = "🟢" if sig['type'] == "BUY" else "🔴"
+        qty = round((50 * 10) / sig['price'], 2)
+        
+        msg = f"""{emoji} <b>{sig['type']} SIGNAL ({'LONG' if sig['type']=='BUY' else 'SHORT'})</b> {emoji}
+━━━━━━━━━━━━━━━━━━━━
+🪙 <b>Asset:</b> {sig['name']}
+⏱ <b>Type:</b> INTRADAY (1h)
+
+💰 <b>Price:</b> {sig['price']}
+🛑 <b>SL:</b> {sig['sl']}
+🎯 <b>TP:</b> {sig['tp']}
+📊 <b>Score:</b> {sig['score']}/100 🏆
+
+🚀 <b>Qty:</b> {qty} (Margin: $50)
+📈 RSI: {round(float(sig['rsi']),1)} | Vol: {round(float(sig['rvol']),1)}x | {sig['pattern']}"""
+        
+        send_telegram_alert(msg)
+        cooldown_data[sig['ticker']] = now.strftime("%Y-%m-%d %H:%M:%S")
+        save_cooldown(cooldown_data)
 
 if __name__ == "__main__":
     analyze_market()
