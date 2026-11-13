@@ -159,7 +159,7 @@ async fn analyze_coin(client: &Client, symbol: &str) -> Option<(String, f64)> {
 async fn main() {
     dotenvy::dotenv().ok();
     let bot = Bot::from_env();
-    let chat_id: i64 = std::env::var("TELEGRAM_CHAT_ID").unwrap().parse().unwrap();
+    let chat_id = teloxide::types::ChatId(std::env::var("TELEGRAM_CHAT_ID").unwrap().parse().unwrap());
     let client = Client::new();
     let coins = vec![
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
