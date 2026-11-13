@@ -1,34 +1,22 @@
-name: Run Trading Bot
+name: Rust Crypto Signal Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    - cron: '*/15 * * * *' # Har 15 minute mein chalega
+  workflow_dispatch: # Manual run karne ke liye
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      
-      - name: Cache Cooldown
-        uses: actions/cache@v4
-        with:
-          path: cooldown.json
-          key: cooldown-cache-${{ github.run_id }}
-          restore-keys: cooldown-cache-
-      
-      - name: Run bot
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Bot
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python bot.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: cargo run --release
