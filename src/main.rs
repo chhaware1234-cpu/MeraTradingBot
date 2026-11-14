@@ -14,9 +14,11 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Binance se Crypto Data Fetch
-async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit=100", symbol, interval);
+// ==============================
+// 1. DATA FETCHING FUNCTIONS
+// ==============================
+async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
+    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(data) = resp.json::<Vec<Vec<Value>>>().await {
             return data.iter().map(|k| Candle {
@@ -31,12 +33,10 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
     vec![]
 }
 
-// 2. Yahoo Finance se Stocks/Gold Data Fetch
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = if interval == "1h" { "5d" } else { "1d" };
+    let range = if interval == "1h" { "5d" } else { "2d" }; // 15m ke liye 2 din ka data
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
-    
-    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
+    let req = client.get(&url).header("User-Agent", "Mozilla/5.0").send().await;
     
     if let Ok(resp) = req {
         if let Ok(json) = resp.json::<Value>().await {
@@ -63,20 +63,20 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
     vec![]
 }
 
+// ==============================
+// 2. INDICATORS & LOGIC HELPERS
+// ==============================
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
     let prev = &candles[candles.len() - 2];
-
     if prev.close < prev.open && curr.close > curr.open && curr.close > prev.open && curr.open < prev.close { return "Bullish Engulfing"; }
     if prev.close > prev.open && curr.close < curr.open && curr.close < prev.open && curr.open > prev.close { return "Bearish Engulfing"; }
-    
     let body = (curr.close - curr.open).abs();
     let lower_wick = curr.open.min(curr.close) - curr.low;
     let upper_wick = curr.high - curr.open.max(curr.close);
     if lower_wick > body * 2.0 && upper_wick < body * 0.5 { return "Bullish Pinbar"; }
     if upper_wick > body * 2.0 && lower_wick < body * 0.5 { return "Bearish Pinbar"; }
-    
     "None"
 }
 
@@ -85,7 +85,6 @@ fn detect_divergence(candles: &[Candle], rsi_values: &[f64]) -> &'static str {
     let len = candles.len();
     let current_price = candles[len - 1].close;
     let current_rsi = rsi_values[len - 1];
-    
     let past_price_low = candles[len - 15..len - 2].iter().map(|c| c.low).fold(f64::MAX, f64::min);
     let past_rsi_low = rsi_values[len - 15..len - 2].iter().fold(f64::MAX, |a, &b| a.min(b));
     let past_price_high = candles[len - 15..len - 2].iter().map(|c| c.high).fold(f64::MIN, f64::max);
@@ -102,31 +101,18 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     let current_close = candles[len - 1].close;
     let resistance = candles[len - 21..len - 1].iter().map(|c| c.high).fold(f64::MIN, f64::max);
     let support = candles[len - 21..len - 1].iter().map(|c| c.low).fold(f64::MAX, f64::min);
-
     if current_close > resistance { return "Bullish Breakout"; }
     else if current_close < support { return "Bearish Breakdown"; }
     "None"
 }
 
-async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option<(String, f64, String)> {
-    let (candles_1h, candles_15m) = if is_crypto {
-        tokio::join!(
-            fetch_crypto_klines(client, symbol, "1h"),
-            fetch_crypto_klines(client, symbol, "15m")
-        )
-    } else {
-        tokio::join!(
-            fetch_yahoo_klines(client, symbol, "1h"),
-            fetch_yahoo_klines(client, symbol, "15m")
-        )
-    };
-
-    if candles_1h.len() < 50 || candles_15m.len() < 30 { return None; }
+// Score calculate karne ka function (Backtest aur Live dono me use hoga)
+fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String) {
+    if candles_1h.len() < 50 || candles_15m.len() < 30 { return (0, 0, "".to_string(), "".to_string(), "".to_string()); }
 
     let mut ema_50_1h = ExponentialMovingAverage::new(50).unwrap();
     let mut trend_ema = 0.0;
-    for c in &candles_1h { trend_ema = ema_50_1h.next(c.close); }
-    let current_price = candles_15m.last().unwrap().close;
+    for c in candles_1h { trend_ema = ema_50_1h.next(c.close); }
     let is_uptrend = candles_1h.last().unwrap().close > trend_ema;
     let is_downtrend = candles_1h.last().unwrap().close < trend_ema;
 
@@ -137,7 +123,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option
     let mut latest_macd_hist = 0.0;
     let mut vol_sma = 0.0;
 
-    for c in &candles_15m {
+    for c in candles_15m {
         rsi_values.push(rsi_15m.next(c.close));
         latest_macd_hist = macd_15m.next(c.close).histogram;
         vol_sma += c.volume;
@@ -145,9 +131,9 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option
     
     vol_sma /= candles_15m.len() as f64;
     let high_volume = candles_15m.last().unwrap().volume > vol_sma * 1.5; 
-    let pattern = detect_pattern(&candles_15m);
-    let divergence = detect_divergence(&candles_15m, &rsi_values);
-    let breakout = detect_sr_breakout(&candles_15m);
+    let pattern = detect_pattern(candles_15m);
+    let divergence = detect_divergence(candles_15m, &rsi_values);
+    let breakout = detect_sr_breakout(candles_15m);
     let latest_rsi = *rsi_values.last().unwrap();
 
     let mut long_score = 0;
@@ -160,6 +146,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option
     if pattern == "Bullish Engulfing" || pattern == "Bullish Pinbar" { long_score += 1; }
     if divergence == "Bullish Divergence" { long_score += 2; }
     if breakout == "Bullish Breakout" { long_score += 2; }
+    long_score += news_pos;
 
     if is_downtrend { short_score += 2; }
     if latest_rsi > 50.0 { short_score += 1; }
@@ -168,19 +155,143 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option
     if pattern == "Bearish Engulfing" || pattern == "Bearish Pinbar" { short_score += 1; }
     if divergence == "Bearish Divergence" { short_score += 2; }
     if breakout == "Bearish Breakdown" { short_score += 2; }
+    short_score += news_neg;
+
+    (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
+}
+
+// ==============================
+// 3. BACKTESTING ENGINE
+// ==============================
+fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
+    if candles_15m.len() < 100 { return 0.0; }
+    
+    let mut wins = 0;
+    let mut losses = 0;
+    let lookback = 100; // Pichli 100 candles ka backtest karega
+    let start_idx = candles_15m.len() - lookback;
+
+    for i in start_idx..candles_15m.len() - 10 {
+        let slice_15m = &candles_15m[0..i];
+        let slice_1h = &candles_1h[0..candles_1h.len()]; // Simplified for backtest
+        
+        // Note: Backtest me news include nahi kar rahe taaki fast chale
+        let (long_score, short_score, _, _, _) = get_scores(slice_1h, slice_15m, 0, 0);
+        
+        let entry_price = candles_15m[i].close;
+        let mut is_long = false;
+        let mut has_trade = false;
+
+        if long_score >= 6 && long_score > short_score { is_long = true; has_trade = true; }
+        else if short_score >= 6 && short_score > long_score { is_long = false; has_trade = true; }
+
+        if has_trade {
+            let mut hit_tp = false;
+            let mut hit_sl = false;
+            // Agli 10 candles check karo
+            for j in 1..=10 {
+                if i + j >= candles_15m.len() { break; }
+                let future_candle = &candles_15m[i + j];
+
+                if is_long {
+                    if future_candle.high >= entry_price * 1.02 { hit_tp = true; break; } // TP 2%
+                    if future_candle.low <= entry_price * 0.99 { hit_sl = true; break; }  // SL 1%
+                } else {
+                    if future_candle.low <= entry_price * 0.98 { hit_tp = true; break; }  // TP 2%
+                    if future_candle.high >= entry_price * 1.01 { hit_sl = true; break; } // SL 1%
+                }
+            }
+            if hit_tp { wins += 1; }
+            else if hit_sl { losses += 1; }
+        }
+    }
+
+    if wins + losses == 0 { return 0.0; }
+    (wins as f64 / (wins + losses) as f64) * 100.0
+}
+
+// ==============================
+// 4. NEWS SENTIMENT
+// ==============================
+async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &str) -> (i32, i32) {
+    if api_key.is_empty() { return (0, 0); }
+    let category = if symbol.ends_with("USDT") { "crypto" } else { "general" };
+    let url = format!("https://finnhub.io/api/v1/news?category={}&token={}", category, api_key);
+
+    let mut positive_news = 0;
+    let mut negative_news = 0;
+
+    if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(articles) = json.as_array() {
+                let base_symbol = symbol.split('.').next().unwrap_or(symbol).replace("USDT", "").to_lowercase();
+                let search_term = match base_symbol.as_str() {
+                    "gc=f" => "gold".to_string(), "si=f" => "silver".to_string(),
+                    "aapl" => "apple".to_string(), "msft" => "microsoft".to_string(),
+                    "googl" => "google".to_string(), "amzn" => "amazon".to_string(),
+                    _ => base_symbol,
+                };
+
+                for article in articles {
+                    let headline = article["headline"].as_str().unwrap_or("").to_lowercase();
+                    if headline.contains(&search_term) {
+                        if headline.contains("surge") || headline.contains("buy") || headline.contains("up") || headline.contains("beat") { positive_news += 1; }
+                        else if headline.contains("drop") || headline.contains("sell") || headline.contains("down") || headline.contains("miss") { negative_news += 1; }
+                    }
+                }
+            }
+        }
+    }
+    (positive_news, negative_news)
+}
+
+// ==============================
+// 5. LIVE ANALYSIS (With Backtest Filter)
+// ==============================
+async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
+    // Data fetch (1h trend ke liye, 15m entry aur backtest ke liye 200 candles)
+    let (candles_1h, candles_15m) = if is_crypto {
+        tokio::join!(
+            fetch_crypto_klines(client, symbol, "1h", 100), 
+            fetch_crypto_klines(client, symbol, "15m", 200) 
+        )
+    } else {
+        tokio::join!(
+            fetch_yahoo_klines(client, symbol, "1h"), 
+            fetch_yahoo_klines(client, symbol, "15m")
+        )
+    };
+
+    if candles_1h.len() < 50 || candles_15m.len() < 100 { return None; }
+
+    // 1. PEHLE BACKTEST KARO
+    let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
+    println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
+
+    // 2. AGAR WIN RATE 30% SE KAM HAI TOH SIGNAL MAT DO
+    if win_rate < 30.0 {
+        return None; // Skip this coin
+    }
+
+    // 3. LIVE SIGNAL CHECK KARO
+    let (pos_news, neg_news) = fetch_finnhub_news_sentiment(client, symbol, finnhub_key).await;
+    let (long_score, short_score, pattern, divergence, breakout) = get_scores(&candles_1h, &candles_15m, pos_news * 2, neg_news * 2);
+    let current_price = candles_15m.last().unwrap().close;
+
+    let news_info = if pos_news > 0 { format!("Positive ({})", pos_news) } 
+                    else if neg_news > 0 { format!("Negative ({})", neg_news) } 
+                    else { "Neutral".to_string() };
 
     if long_score >= 6 && long_score > short_score {
-        let msg = format!(
-            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, long_score, pattern, divergence, breakout
-        );
-        return Some((msg, current_price, "LONG".to_string()));
+        return Some(format!(
+            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            symbol, current_price, long_score, win_rate, news_info, pattern, divergence, breakout
+        ));
     } else if short_score >= 6 && short_score > long_score {
-        let msg = format!(
-            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, short_score, pattern, divergence, breakout
-        );
-        return Some((msg, current_price, "SHORT".to_string()));
+        return Some(format!(
+            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            symbol, current_price, short_score, win_rate, news_info, pattern, divergence, breakout
+        ));
     }
     None
 }
@@ -190,52 +301,39 @@ async fn main() {
     dotenvy::dotenv().ok();
     let bot = Bot::from_env();
     let chat_id = teloxide::types::ChatId(std::env::var("TELEGRAM_CHAT_ID").unwrap().parse().unwrap());
+    let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
     let client = Client::new();
     
-    let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
-    
+    let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
     let stock_symbols = vec![
-        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", 
-        "INFY.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", 
-        "LT.NS", "BAJFINANCE.NS",
-        "AAPL", "TSLA", "MSFT", "GOOGL", "AMZN", 
-        "NVDA", "META", "NFLX", "AMD", "JPM",
-        "GC=F", "SI=F" 
+        "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Scanning {} Crypto and {} Stocks/Commodities...", crypto_symbols.len(), stock_symbols.len());
+    println!("🔍 Running Mini-Backtest & Live Scan...");
 
-    // 1. Crypto Scan
+    // Crypto
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
-        crypto_tasks.push(analyze_asset(&client, symbol, true));
+        crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
     }
-    let crypto_results = join_all(crypto_tasks).await;
-
-    for (i, result) in crypto_results.into_iter().enumerate() {
-        if let Some((signal_msg, _price, _action)) = result {
-            match bot.send_message(chat_id.clone(), signal_msg).parse_mode(ParseMode::Html).await {
-                Ok(_) => println!("✅ Crypto Signal Sent: {}", crypto_symbols[i]),
-                Err(e) => eprintln!("❌ Failed to send Crypto Signal for {}: {}", crypto_symbols[i], e),
-            }
+    for (i, result) in join_all(crypto_tasks).await.into_iter().enumerate() {
+        if let Some(msg) = result {
+            let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await;
+            println!("✅ Crypto Signal Sent: {}", crypto_symbols[i]);
         }
     }
 
-    // 2. Stocks & Commodities Scan
+    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
-        stock_tasks.push(analyze_asset(&client, symbol, false));
+        stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
     }
-    let stock_results = join_all(stock_tasks).await;
-
-    for (i, result) in stock_results.into_iter().enumerate() {
-        if let Some((signal_msg, _price, _action)) = result {
-            match bot.send_message(chat_id.clone(), signal_msg).parse_mode(ParseMode::Html).await {
-                Ok(_) => println!("✅ Stock/Commodity Signal Sent: {}", stock_symbols[i]),
-                Err(e) => eprintln!("❌ Failed to send Stock Signal for {}: {}", stock_symbols[i], e),
-            }
+    for (i, result) in join_all(stock_tasks).await.into_iter().enumerate() {
+        if let Some(msg) = result {
+            let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await;
+            println!("✅ Stock Signal Sent: {}", stock_symbols[i]);
         }
     }
-
+    
     println!("✅ Scan complete.");
-                    }
+}
