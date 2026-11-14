@@ -14,16 +14,8 @@ struct Candle {
     volume: f64,
 }
 
-#[derive(Debug, Clone)]
-struct ActiveTrade {
-    symbol: String,
-    action: String,       
-    entry_price: f64,
-    highest_lowest: f64,  
-    stop_loss: f64,       
-}
-
-async fn fetch_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
+// 1. Binance se Crypto Data Fetch
+async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit=100", symbol, interval);
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(data) = resp.json::<Vec<Vec<Value>>>().await {
@@ -34,6 +26,38 @@ async fn fetch_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Cand
                 close: k[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
                 volume: k[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
             }).collect();
+        }
+    }
+    vec![]
+}
+
+// 2. Yahoo Finance se Stocks/Gold Data Fetch
+async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
+    let range = if interval == "1h" { "5d" } else { "1d" };
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
+    
+    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
+    
+    if let Ok(resp) = req {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(result) = json["chart"]["result"].as_array() {
+                if let Some(data) = result.get(0) {
+                    if let Some(quote) = data["indicators"]["quote"].as_array().and_then(|a| a.get(0)) {
+                        let mut candles = vec![];
+                        if let (Some(o), Some(h), Some(l), Some(c), Some(v)) = (
+                            quote["open"].as_array(), quote["high"].as_array(), quote["low"].as_array(), quote["close"].as_array(), quote["volume"].as_array()
+                        ) {
+                            for i in 0..c.len() {
+                                if let (Some(open), Some(high), Some(low), Some(close)) = (o[i].as_f64(), h[i].as_f64(), l[i].as_f64(), c[i].as_f64()) {
+                                    let volume = v[i].as_f64().unwrap_or(0.0);
+                                    candles.push(Candle { open, high, low, close, volume });
+                                }
+                            }
+                        }
+                        return candles;
+                    }
+                }
+            }
         }
     }
     vec![]
@@ -84,11 +108,18 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     "None"
 }
 
-async fn analyze_coin(client: &Client, symbol: &str) -> Option<(String, f64)> {
-    let (candles_1h, candles_15m) = tokio::join!(
-        fetch_klines(client, symbol, "1h"),
-        fetch_klines(client, symbol, "15m")
-    );
+async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool) -> Option<(String, f64, String)> {
+    let (candles_1h, candles_15m) = if is_crypto {
+        tokio::join!(
+            fetch_crypto_klines(client, symbol, "1h"),
+            fetch_crypto_klines(client, symbol, "15m")
+        )
+    } else {
+        tokio::join!(
+            fetch_yahoo_klines(client, symbol, "1h"),
+            fetch_yahoo_klines(client, symbol, "15m")
+        )
+    };
 
     if candles_1h.len() < 50 || candles_15m.len() < 30 { return None; }
 
@@ -138,19 +169,18 @@ async fn analyze_coin(client: &Client, symbol: &str) -> Option<(String, f64)> {
     if divergence == "Bearish Divergence" { short_score += 2; }
     if breakout == "Bearish Breakdown" { short_score += 2; }
 
-    // Score threshold yahan 4 kar diya gaya hai testing ke liye
     if long_score >= 6 && long_score > short_score {
         let msg = format!(
-            "🟢 **NEW LONG ENTRY: {}**\n\nEntry Price: `{}`\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, long_score, pattern, divergence, breakout
         );
-        return Some((msg, current_price));
+        return Some((msg, current_price, "LONG".to_string()));
     } else if short_score >= 6 && short_score > long_score {
         let msg = format!(
-            "🔴 **NEW SHORT ENTRY: {}**\n\nEntry Price: `{}`\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, short_score, pattern, divergence, breakout
         );
-        return Some((msg, current_price));
+        return Some((msg, current_price, "SHORT".to_string()));
     }
     None
 }
@@ -161,50 +191,51 @@ async fn main() {
     let bot = Bot::from_env();
     let chat_id = teloxide::types::ChatId(std::env::var("TELEGRAM_CHAT_ID").unwrap().parse().unwrap());
     let client = Client::new();
-    let coins = vec![
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-        "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "MATICUSDT",
+    
+    let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+    
+    let stock_symbols = vec![
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", 
+        "INFY.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", 
+        "LT.NS", "BAJFINANCE.NS",
+        "AAPL", "TSLA", "MSFT", "GOOGL", "AMZN", 
+        "NVDA", "META", "NFLX", "AMD", "JPM",
+        "GC=F", "SI=F" 
     ];
 
-    let active_trades: Vec<ActiveTrade> = Vec::new();
+    println!("🔍 Scanning {} Crypto and {} Stocks/Commodities...", crypto_symbols.len(), stock_symbols.len());
 
-    println!("🔍 Scanning & Managing Trades...");
+    // 1. Crypto Scan
+    let mut crypto_tasks = vec![];
+    for symbol in &crypto_symbols {
+        crypto_tasks.push(analyze_asset(&client, symbol, true));
+    }
+    let crypto_results = join_all(crypto_tasks).await;
 
-    // Ye line Telegram par test message bhejegi
-    let _ = bot.send_message(chat_id.clone(), "🤖 Bot successfully chalu ho gaya hai!").await;
-
-    for trade in &active_trades {
-        if let Ok(resp) = client.get(format!("https://api.binance.com/api/v3/ticker/price?symbol={}", trade.symbol)).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let current_price = json["price"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                
-                if trade.action == "LONG" && current_price <= trade.stop_loss {
-                    let msg = format!("🚨 **EXIT LONG: {}**\n\nStop Loss Hit!\nExit Price: `{:.4}`", trade.symbol, current_price);
-                    let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::MarkdownV2).await;
-                } else if trade.action == "SHORT" && current_price >= trade.stop_loss {
-                    let msg = format!("🚨 **EXIT SHORT: {}**\n\nStop Loss Hit!\nExit Price: `{:.4}`", trade.symbol, current_price);
-                    let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::MarkdownV2).await;
-                }
+    for (i, result) in crypto_results.into_iter().enumerate() {
+        if let Some((signal_msg, _price, _action)) = result {
+            match bot.send_message(chat_id.clone(), signal_msg).parse_mode(ParseMode::Html).await {
+                Ok(_) => println!("✅ Crypto Signal Sent: {}", crypto_symbols[i]),
+                Err(e) => eprintln!("❌ Failed to send Crypto Signal for {}: {}", crypto_symbols[i], e),
             }
         }
     }
-    
-    let mut tasks = vec![];
-    for symbol in &coins {
-        tasks.push(analyze_coin(&client, symbol));
-    }
-    let results = join_all(tasks).await;
 
-    for (i, result) in results.into_iter().enumerate() {
-        if let Some((signal_msg, _entry_price)) = result {
-            let symbol = coins[i].to_string();
-            
-            if !active_trades.iter().any(|t| t.symbol == symbol) {
-                let _ = bot.send_message(chat_id.clone(), signal_msg).parse_mode(ParseMode::MarkdownV2).await;
-                println!("New Trade Added: {}", symbol);
+    // 2. Stocks & Commodities Scan
+    let mut stock_tasks = vec![];
+    for symbol in &stock_symbols {
+        stock_tasks.push(analyze_asset(&client, symbol, false));
+    }
+    let stock_results = join_all(stock_tasks).await;
+
+    for (i, result) in stock_results.into_iter().enumerate() {
+        if let Some((signal_msg, _price, _action)) = result {
+            match bot.send_message(chat_id.clone(), signal_msg).parse_mode(ParseMode::Html).await {
+                Ok(_) => println!("✅ Stock/Commodity Signal Sent: {}", stock_symbols[i]),
+                Err(e) => eprintln!("❌ Failed to send Stock Signal for {}: {}", stock_symbols[i], e),
             }
         }
     }
 
     println!("✅ Scan complete.");
-}
+                    }
