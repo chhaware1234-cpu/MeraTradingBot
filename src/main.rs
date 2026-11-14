@@ -14,9 +14,6 @@ struct Candle {
     volume: f64,
 }
 
-// ==============================
-// 1. DATA FETCHING FUNCTIONS
-// ==============================
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
     let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
     if let Ok(resp) = client.get(&url).send().await {
@@ -34,7 +31,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limi
 }
 
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = if interval == "1h" { "5d" } else { "2d" }; // 15m ke liye 2 din ka data
+    let range = if interval == "1h" { "5d" } else { "2d" };
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
     let req = client.get(&url).header("User-Agent", "Mozilla/5.0").send().await;
     
@@ -63,9 +60,6 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
     vec![]
 }
 
-// ==============================
-// 2. INDICATORS & LOGIC HELPERS
-// ==============================
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -106,7 +100,6 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     "None"
 }
 
-// Score calculate karne ka function (Backtest aur Live dono me use hoga)
 fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String) {
     if candles_1h.len() < 50 || candles_15m.len() < 30 { return (0, 0, "".to_string(), "".to_string(), "".to_string()); }
 
@@ -160,59 +153,49 @@ fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news
     (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
 }
 
-// ==============================
-// 3. BACKTESTING ENGINE
-// ==============================
 fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     if candles_15m.len() < 100 { return 0.0; }
-    
     let mut wins = 0;
     let mut losses = 0;
-    let lookback = 100; // Pichli 100 candles ka backtest karega
+    let lookback = 100;
     let start_idx = candles_15m.len() - lookback;
 
     for i in start_idx..candles_15m.len() - 10 {
         let slice_15m = &candles_15m[0..i];
-        let slice_1h = &candles_1h[0..candles_1h.len()]; // Simplified for backtest
+        let slice_1h = &candles_1h[0..candles_1h.len()]; 
         
-        // Note: Backtest me news include nahi kar rahe taaki fast chale
         let (long_score, short_score, _, _, _) = get_scores(slice_1h, slice_15m, 0, 0);
-        
         let entry_price = candles_15m[i].close;
         let mut is_long = false;
         let mut has_trade = false;
 
-        if long_score >= 6 && long_score > short_score { is_long = true; has_trade = true; }
-        else if short_score >= 6 && short_score > long_score { is_long = false; has_trade = true; }
+        // TESTING KE LIYE SCORE 4 KIYA GAYA HAI
+        if long_score >= 4 && long_score > short_score { is_long = true; has_trade = true; }
+        else if short_score >= 4 && short_score > long_score { is_long = false; has_trade = true; }
 
         if has_trade {
             let mut hit_tp = false;
             let mut hit_sl = false;
-            // Agli 10 candles check karo
             for j in 1..=10 {
                 if i + j >= candles_15m.len() { break; }
                 let future_candle = &candles_15m[i + j];
 
                 if is_long {
-                    if future_candle.high >= entry_price * 1.02 { hit_tp = true; break; } // TP 2%
-                    if future_candle.low <= entry_price * 0.99 { hit_sl = true; break; }  // SL 1%
+                    if future_candle.high >= entry_price * 1.02 { hit_tp = true; break; }
+                    if future_candle.low <= entry_price * 0.99 { hit_sl = true; break; }
                 } else {
-                    if future_candle.low <= entry_price * 0.98 { hit_tp = true; break; }  // TP 2%
-                    if future_candle.high >= entry_price * 1.01 { hit_sl = true; break; } // SL 1%
+                    if future_candle.low <= entry_price * 0.98 { hit_tp = true; break; }
+                    if future_candle.high >= entry_price * 1.01 { hit_sl = true; break; }
                 }
             }
             if hit_tp { wins += 1; }
             else if hit_sl { losses += 1; }
         }
     }
-
     if wins + losses == 0 { return 0.0; }
     (wins as f64 / (wins + losses) as f64) * 100.0
 }
 
-// ==============================
-// 4. NEWS SENTIMENT
-// ==============================
 async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &str) -> (i32, i32) {
     if api_key.is_empty() { return (0, 0); }
     let category = if symbol.ends_with("USDT") { "crypto" } else { "general" };
@@ -245,11 +228,7 @@ async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &s
     (positive_news, negative_news)
 }
 
-// ==============================
-// 5. LIVE ANALYSIS (With Backtest Filter)
-// ==============================
 async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
-    // Data fetch (1h trend ke liye, 15m entry aur backtest ke liye 200 candles)
     let (candles_1h, candles_15m) = if is_crypto {
         tokio::join!(
             fetch_crypto_klines(client, symbol, "1h", 100), 
@@ -264,16 +243,14 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
 
     if candles_1h.len() < 50 || candles_15m.len() < 100 { return None; }
 
-    // 1. PEHLE BACKTEST KARO
     let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
     println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
 
-    // 2. AGAR WIN RATE 30% SE KAM HAI TOH SIGNAL MAT DO
-    if win_rate < 00.0 {
-        return None; // Skip this coin
+    // TESTING KE LIYE WIN RATE FILTER OFF (0.0) KIYA GAYA HAI
+    if win_rate < 0.0 {
+        return None; 
     }
 
-    // 3. LIVE SIGNAL CHECK KARO
     let (pos_news, neg_news) = fetch_finnhub_news_sentiment(client, symbol, finnhub_key).await;
     let (long_score, short_score, pattern, divergence, breakout) = get_scores(&candles_1h, &candles_15m, pos_news * 2, neg_news * 2);
     let current_price = candles_15m.last().unwrap().close;
@@ -282,6 +259,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
                     else if neg_news > 0 { format!("Negative ({})", neg_news) } 
                     else { "Neutral".to_string() };
 
+    // TESTING KE LIYE SCORE 4 KIYA GAYA HAI
     if long_score >= 4 && long_score > short_score {
         return Some(format!(
             "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
@@ -311,7 +289,13 @@ async fn main() {
 
     println!("🔍 Running Mini-Backtest & Live Scan...");
 
-    // Crypto
+    // ====================================================
+    // TEST MESSAGE (Yahan maine ise sahi jagah par daala hai)
+    // ====================================================
+    let _ = bot.send_message(chat_id.clone(), "🟢 <b>TEST SIGNAL: BTCUSDT</b>\n\nEntry Price: <code>65000.00</code>\n🔥 Score: 8/10\n📊 Win Rate: 45%\n📰 News: Positive\n🚀 S/R: Bullish Breakout").parse_mode(ParseMode::Html).await;
+    println!("✅ Test Message Sent!");
+    // ====================================================
+
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -323,7 +307,6 @@ async fn main() {
         }
     }
 
-    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
@@ -336,4 +319,4 @@ async fn main() {
     }
     
     println!("✅ Scan complete.");
-}
+        }
