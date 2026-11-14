@@ -269,7 +269,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
     println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
 
     // 2. AGAR WIN RATE 30% SE KAM HAI TOH SIGNAL MAT DO
-    if win_rate < 30.0 {
+    if win_rate < 00.0 {
         return None; // Skip this coin
     }
 
@@ -282,12 +282,12 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
                     else if neg_news > 0 { format!("Negative ({})", neg_news) } 
                     else { "Neutral".to_string() };
 
-    if long_score >= 6 && long_score > short_score {
+    if long_score >= 4 && long_score > short_score {
         return Some(format!(
             "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, long_score, win_rate, news_info, pattern, divergence, breakout
         ));
-    } else if short_score >= 6 && short_score > long_score {
+    } else if short_score >= 4 && short_score > long_score {
         return Some(format!(
             "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, short_score, win_rate, news_info, pattern, divergence, breakout
