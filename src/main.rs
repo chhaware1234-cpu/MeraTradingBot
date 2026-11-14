@@ -14,18 +14,29 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Binance se Crypto Data Fetch
+// 1. Bybit se Crypto Data Fetch (GitHub par block nahi hota)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
+    let bybit_interval = if interval == "1h" { "60" } else { "15" }; // Bybit format
+    let url = format!("https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}&limit={}", symbol, bybit_interval, limit);
+    
     if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(data) = resp.json::<Vec<Vec<Value>>>().await {
-            return data.iter().map(|k| Candle {
-                open: k[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                high: k[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                low: k[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                close: k[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                volume: k[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-            }).collect();
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(list) = json["result"]["list"].as_array() {
+                let mut candles = vec![];
+                // Bybit newest se oldest deta hai, hume reverse karna hoga
+                for k in list.iter().rev() {
+                    if let Some(arr) = k.as_array() {
+                        candles.push(Candle {
+                            open: arr[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                            high: arr[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                            low: arr[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                            close: arr[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                            volume: arr[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                        });
+                    }
+                }
+                return candles;
+            }
         }
     }
     vec![]
@@ -62,7 +73,7 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
     vec![]
 }
 
-// 3. Indicators & Logic Helpers
+// 3. Indicators & Logic
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -156,7 +167,7 @@ fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news
     (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
 }
 
-// 4. Backtesting Engine (Win Rate Calculator)
+// 4. Backtesting Engine
 fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     if candles_15m.len() < 100 { return 0.0; }
     let mut wins = 0;
@@ -199,31 +210,47 @@ fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     (wins as f64 / (wins + losses) as f64) * 100.0
 }
 
-// 5. News Sentiment (Finnhub)
-async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &str) -> (i32, i32) {
-    if api_key.is_empty() { return (0, 0); }
-    let category = if symbol.ends_with("USDT") { "crypto" } else { "general" };
-    let url = format!("https://finnhub.io/api/v1/news?category={}&token={}", category, api_key);
-
+// 5. News Sentiment (Crypto: Free API | Stocks: Finnhub)
+async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) -> (i32, i32) {
     let mut positive_news = 0;
     let mut negative_news = 0;
 
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(json) = resp.json::<Value>().await {
-            if let Some(articles) = json.as_array() {
-                let base_symbol = symbol.split('.').next().unwrap_or(symbol).replace("USDT", "").to_lowercase();
-                let search_term = match base_symbol.as_str() {
-                    "gc=f" => "gold".to_string(), "si=f" => "silver".to_string(),
-                    "aapl" => "apple".to_string(), "msft" => "microsoft".to_string(),
-                    "googl" => "google".to_string(), "amzn" => "amazon".to_string(),
-                    _ => base_symbol,
-                };
+    if symbol.ends_with("USDT") {
+        // Crypto News via cryptocurrency.cv
+        let coin = symbol.replace("USDT", "");
+        let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(json) = resp.json::<Value>().await {
+                if let Some(label) = json["label"].as_str() {
+                    match label {
+                        "bullish" => positive_news = 3,
+                        "bearish" => negative_news = 3,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    } else {
+        // Stocks News via Finnhub
+        if finnhub_key.is_empty() { return (0, 0); }
+        let url = format!("https://finnhub.io/api/v1/news?category=general&token={}", finnhub_key);
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(json) = resp.json::<Value>().await {
+                if let Some(articles) = json.as_array() {
+                    let base_symbol = symbol.split('.').next().unwrap_or(symbol).to_lowercase();
+                    let search_term = match base_symbol.as_str() {
+                        "gc=f" => "gold".to_string(), "si=f" => "silver".to_string(),
+                        "aapl" => "apple".to_string(), "msft" => "microsoft".to_string(),
+                        "googl" => "google".to_string(), "amzn" => "amazon".to_string(),
+                        _ => base_symbol,
+                    };
 
-                for article in articles {
-                    let headline = article["headline"].as_str().unwrap_or("").to_lowercase();
-                    if headline.contains(&search_term) {
-                        if headline.contains("surge") || headline.contains("buy") || headline.contains("up") || headline.contains("beat") { positive_news += 1; }
-                        else if headline.contains("drop") || headline.contains("sell") || headline.contains("down") || headline.contains("miss") { negative_news += 1; }
+                    for article in articles {
+                        let headline = article["headline"].as_str().unwrap_or("").to_lowercase();
+                        if headline.contains(&search_term) {
+                            if headline.contains("surge") || headline.contains("buy") || headline.contains("up") || headline.contains("beat") { positive_news += 1; }
+                            else if headline.contains("drop") || headline.contains("sell") || headline.contains("down") || headline.contains("miss") { negative_news += 1; }
+                        }
                     }
                 }
             }
@@ -248,16 +275,14 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
 
     if candles_1h.len() < 50 || candles_15m.len() < 100 { return None; }
 
-    // Backtest Filter
     let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
     println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
 
     if win_rate < 30.0 {
-        return None; // Strategy is not working on this coin right now
+        return None; 
     }
 
-    // Live Scoring
-    let (pos_news, neg_news) = fetch_finnhub_news_sentiment(client, symbol, finnhub_key).await;
+    let (pos_news, neg_news) = fetch_news_sentiment(client, symbol, finnhub_key).await;
     let (long_score, short_score, pattern, divergence, breakout) = get_scores(&candles_1h, &candles_15m, pos_news * 2, neg_news * 2);
     let current_price = candles_15m.last().unwrap().close;
 
@@ -287,15 +312,14 @@ async fn main() {
     let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
     let client = Client::new();
     
-    // Aap yahan apne pasand ke coins aur stocks add/remove kar sakte hain
     let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
     let stock_symbols = vec![
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Running Final Bot: Mini-Backtest & Live Scan...");
+    println!("🔍 Final Master Bot Running...");
 
-    // Crypto Scan
+    // Crypto
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -307,7 +331,7 @@ async fn main() {
         }
     }
 
-    // Stocks & Commodities Scan
+    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
@@ -315,7 +339,7 @@ async fn main() {
     for (i, result) in join_all(stock_tasks).await.into_iter().enumerate() {
         if let Some(msg) = result {
             let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await;
-            println!("✅ Stock/Commodity Signal Sent: {}", stock_symbols[i]);
+            println!("✅ Stock Signal Sent: {}", stock_symbols[i]);
         }
     }
     
