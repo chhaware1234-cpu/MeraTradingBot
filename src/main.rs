@@ -138,13 +138,14 @@ async fn analyze_coin(client: &Client, symbol: &str) -> Option<(String, f64)> {
     if divergence == "Bearish Divergence" { short_score += 2; }
     if breakout == "Bearish Breakdown" { short_score += 2; }
 
-    if long_score >= 6 && long_score > short_score {
+    // Score threshold yahan 4 kar diya gaya hai testing ke liye
+    if long_score >= 4 && long_score > short_score {
         let msg = format!(
             "🟢 **NEW LONG ENTRY: {}**\n\nEntry Price: `{}`\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, long_score, pattern, divergence, breakout
         );
         return Some((msg, current_price));
-    } else if short_score >= 6 && short_score > long_score {
+    } else if short_score >= 4 && short_score > long_score {
         let msg = format!(
             "🔴 **NEW SHORT ENTRY: {}**\n\nEntry Price: `{}`\n🔥 Score: {}/10\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, short_score, pattern, divergence, breakout
@@ -166,9 +167,11 @@ async fn main() {
     ];
 
     let active_trades: Vec<ActiveTrade> = Vec::new();
-    let trail_percentage = 0.02; 
 
     println!("🔍 Scanning & Managing Trades...");
+
+    // Ye line Telegram par test message bhejegi
+    let _ = bot.send_message(chat_id.clone(), "🤖 Bot successfully chalu ho gaya hai!").await;
 
     for trade in &active_trades {
         if let Ok(resp) = client.get(format!("https://api.binance.com/api/v3/ticker/price?symbol={}", trade.symbol)).send().await {
