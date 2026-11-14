@@ -14,7 +14,6 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Crypto Data (Kraken API - 100% Unblocked on GitHub US Servers)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, _limit: u32) -> Vec<Candle> {
     let pair = match symbol {
         "BTCUSDT" => "XBTUSD",
@@ -22,7 +21,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, _lim
         "SOLUSDT" => "SOLUSD",
         _ => "XBTUSD",
     };
-    let kraken_interval = if interval == "1h" { "60" } else { "5" }; // 5-Minute Entry
+    let kraken_interval = if interval == "1h" { "60" } else { "5" };
     let url = format!("https://api.kraken.com/0/public/OHLC?pair={}&interval={}", pair, kraken_interval);
 
     if let Ok(resp) = client.get(&url).send().await {
@@ -54,7 +53,6 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, _lim
     vec![]
 }
 
-// 2. Stocks & Gold Data (Yahoo Finance)
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let range = "5d";
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
@@ -85,7 +83,6 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
     vec![]
 }
 
-// 3. Indicators & Patterns
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -126,8 +123,9 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     "None"
 }
 
-fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String, f64, f64) {
-    if candles_1h.len() < 30 || candles_5m.len() < 20 { return (0, 0, "".to_string(), "".to_string(), "".to_string(), 50.0, 0.0); }
+// 3. Naya Scoring System (Returns Vol Ratio as well for msg)
+fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String, f64, f64, f64) {
+    if candles_1h.len() < 30 || candles_5m.len() < 20 { return (0, 0, "".to_string(), "".to_string(), "".to_string(), 50.0, 0.0, 1.0); }
 
     let mut ema_50_1h = ExponentialMovingAverage::new(50).unwrap();
     let mut trend_ema = 0.0;
@@ -149,7 +147,10 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     }
     
     vol_sma /= candles_5m.len() as f64;
-    let high_volume = candles_5m.last().unwrap().volume > vol_sma * 1.5; 
+    let current_vol = candles_5m.last().unwrap().volume;
+    let vol_ratio = current_vol / vol_sma; // Naya: Volume Ratio nikalne ke liye
+    let high_volume = vol_ratio > 1.5; 
+    
     let pattern = detect_pattern(candles_5m);
     let divergence = detect_divergence(candles_5m, &rsi_values);
     let breakout = detect_sr_breakout(candles_5m);
@@ -179,10 +180,9 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     if breakout == "Bearish Breakdown" { short_score += 2; }
     short_score += news_neg;
 
-    (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent)
+    (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio)
 }
 
-// 4. News Sentiment
 async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) -> (i32, i32) {
     let mut positive_news = 0;
     let mut negative_news = 0;
@@ -229,7 +229,7 @@ async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) 
     (positive_news, negative_news)
 }
 
-// 5. Analysis & Anti-Late Entry Filter
+// 4. Naya Analysis with TP/SL Calculation
 async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
     let (candles_1h, candles_5m) = if is_crypto {
         tokio::join!(
@@ -243,39 +243,71 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
         )
     };
 
-    if candles_1h.len() < 30 || candles_5m.len() < 20 { 
-        println!("[{}] Skipped: Not enough data.", symbol);
-        return None; 
-    }
+    if candles_1h.len() < 30 || candles_5m.len() < 20 { return None; }
 
     let (pos_news, neg_news) = fetch_news_sentiment(client, symbol, finnhub_key).await;
-    let (long_score, short_score, pattern, divergence, breakout, latest_rsi, candle_change) = 
+    let (long_score, short_score, pattern, divergence, breakout, latest_rsi, candle_change, vol_ratio) = 
         get_scores(&candles_1h, &candles_5m, pos_news * 2, neg_news * 2);
     
     let current_price = candles_5m.last().unwrap().close;
 
-    let news_info = if pos_news > 0 { format!("Positive ({})", pos_news) } 
-                    else if neg_news > 0 { format!("Negative ({})", neg_news) } 
-                    else { "Neutral".to_string() };
+    // Format Asset Name (e.g. BTCUSDT -> BTC)
+    let asset_name = symbol.replace("USDT", "").replace(".NS", "");
 
-    // Anti-Late Entry Logic: Agar 5m candle already 1.2% dump/pump ho chuki hai, toh entry mat do
+    // Score Conversion (Score / 10 * 100) for display
+    let long_score_out_of_100 = (long_score * 10).min(100);
+    let short_score_out_of_100 = (short_score * 10).min(100);
+
+    // Margin and Qty Calculation
+    let margin = 50.0; // $50 default margin
+    let qty = margin / current_price;
+
+    // Anti-Late Entry Logic
     if short_score >= 6 && short_score > long_score {
-        if latest_rsi < 25.0 || candle_change < -1.2 {
-            println!("[{}] Skipped SHORT: Late entry blocked (RSI: {:.1}, Candle: {:.2}%)", symbol, latest_rsi, candle_change);
-            return None; 
-        }
+        if latest_rsi < 25.0 || candle_change < -1.2 { return None; }
+        
+        // SHORT Calculations
+        let sl = current_price * 1.015; // 1.5% SL
+        let tp = current_price * 0.97;  // 3.0% TP
+        
         return Some(format!(
-            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 RSI: {:.1}\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, short_score, latest_rsi, news_info, pattern, divergence, breakout
+            "🔴 <b>SELL SIGNAL (SHORT)</b> 🔴\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            🌍 <b>Asset:</b> {} ({})\n\
+            ⏰ <b>Type:</b> SCALPING (5m)\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            💵 <b>Price:</b> <code>{:.4}</code>\n\
+            🛑 <b>SL:</b> <code>{:.4}</code>\n\
+            🎯 <b>TP:</b> <code>{:.4}</code>\n\
+            📊 <b>Score:</b> {}/100 🏆\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            🚀 <b>Qty:</b> {:.2} (Margin: ${:.0})\n\
+            📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
+            📰 <b>News:</b> {}",
+            asset_name, asset_name, current_price, sl, tp, short_score_out_of_100, qty, margin, latest_rsi, vol_ratio, pattern, if neg_news > 0 { "Negative" } else { "Neutral" }
         ));
     } else if long_score >= 6 && long_score > short_score {
-        if latest_rsi > 75.0 || candle_change > 1.2 {
-            println!("[{}] Skipped LONG: Late entry blocked (RSI: {:.1}, Candle: {:.2}%)", symbol, latest_rsi, candle_change);
-            return None;
-        }
+        if latest_rsi > 75.0 || candle_change > 1.2 { return None; }
+
+        // LONG Calculations
+        let sl = current_price * 0.985; // 1.5% SL
+        let tp = current_price * 1.03;  // 3.0% TP
+
         return Some(format!(
-            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 RSI: {:.1}\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, long_score, latest_rsi, news_info, pattern, divergence, breakout
+            "🟢 <b>BUY SIGNAL (LONG)</b> 🟢\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            🌍 <b>Asset:</b> {} ({})\n\
+            ⏰ <b>Type:</b> SCALPING (5m)\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            💵 <b>Price:</b> <code>{:.4}</code>\n\
+            🛑 <b>SL:</b> <code>{:.4}</code>\n\
+            🎯 <b>TP:</b> <code>{:.4}</code>\n\
+            📊 <b>Score:</b> {}/100 🏆\n\
+            ━━━━━━━━━━━━━━━━━━━━\n\
+            🚀 <b>Qty:</b> {:.2} (Margin: ${:.0})\n\
+            📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
+            📰 <b>News:</b> {}",
+            asset_name, asset_name, current_price, sl, tp, long_score_out_of_100, qty, margin, latest_rsi, vol_ratio, pattern, if pos_news > 0 { "Positive" } else { "Neutral" }
         ));
     }
     None
@@ -289,13 +321,12 @@ async fn main() {
     let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
     let client = Client::new();
     
-    // Yahan aap apne symbols add/remove kar sakte hain
     let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
     let stock_symbols = vec![
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Final 5-Minute Scanner Running (With News & Anti-Late Entry)...");
+    println!("🔍 Premium Formatted Scanner Running...");
 
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
