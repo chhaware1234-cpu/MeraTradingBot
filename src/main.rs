@@ -14,16 +14,20 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Bybit se Crypto Data Fetch (GitHub par block nahi hota)
+// 1. Bybit se Crypto Data Fetch (With Debug Logs)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
-    let bybit_interval = if interval == "1h" { "60" } else { "15" }; // Bybit format
+    let bybit_interval = if interval == "1h" { "60" } else { "15" }; 
     let url = format!("https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}&limit={}", symbol, bybit_interval, limit);
     
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(json) = resp.json::<Value>().await {
+            // Debug: Agar Bybit error de raha hai
+            if json["retCode"].as_i64() != Some(0) {
+                println!("[{}] Bybit API Error: {:?}", symbol, json["retMsg"]);
+                return vec![];
+            }
             if let Some(list) = json["result"]["list"].as_array() {
                 let mut candles = vec![];
-                // Bybit newest se oldest deta hai, hume reverse karna hoga
                 for k in list.iter().rev() {
                     if let Some(arr) = k.as_array() {
                         candles.push(Candle {
@@ -46,7 +50,9 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limi
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let range = if interval == "1h" { "5d" } else { "2d" };
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
-    let req = client.get(&url).header("User-Agent", "Mozilla/5.0").send().await;
+    
+    // Yahoo block na kare isliye proper User-Agent
+    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36").send().await;
     
     if let Ok(resp) = req {
         if let Ok(json) = resp.json::<Value>().await {
@@ -67,13 +73,17 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
                         return candles;
                     }
                 }
+            } else {
+                println!("[{}] Yahoo Finance data not found.", symbol);
             }
         }
+    } else {
+        println!("[{}] Yahoo Finance request failed.", symbol);
     }
     vec![]
 }
 
-// 3. Indicators & Logic
+// 3. Indicators & Logic Helpers
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -210,13 +220,12 @@ fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     (wins as f64 / (wins + losses) as f64) * 100.0
 }
 
-// 5. News Sentiment (Crypto: Free API | Stocks: Finnhub)
+// 5. News Sentiment
 async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) -> (i32, i32) {
     let mut positive_news = 0;
     let mut negative_news = 0;
 
     if symbol.ends_with("USDT") {
-        // Crypto News via cryptocurrency.cv
         let coin = symbol.replace("USDT", "");
         let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
         if let Ok(resp) = client.get(&url).send().await {
@@ -231,7 +240,6 @@ async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) 
             }
         }
     } else {
-        // Stocks News via Finnhub
         if finnhub_key.is_empty() { return (0, 0); }
         let url = format!("https://finnhub.io/api/v1/news?category=general&token={}", finnhub_key);
         if let Ok(resp) = client.get(&url).send().await {
@@ -259,7 +267,7 @@ async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) 
     (positive_news, negative_news)
 }
 
-// 6. Core Analysis & Filter
+// 6. Core Analysis
 async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
     let (candles_1h, candles_15m) = if is_crypto {
         tokio::join!(
@@ -273,12 +281,19 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
         )
     };
 
-    if candles_1h.len() < 50 || candles_15m.len() < 100 { return None; }
+    // DEBUG: Data aaya ya nahi?
+    println!("[{}] Data Fetched: 1h: {}, 15m: {}", symbol, candles_1h.len(), candles_15m.len());
+
+    if candles_1h.len() < 50 || candles_15m.len() < 100 { 
+        println!("[{}] Skipped: Not enough data.", symbol);
+        return None; 
+    }
 
     let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
     println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
 
     if win_rate < 30.0 {
+        println!("[{}] Skipped: Win rate below 30%.", symbol);
         return None; 
     }
 
@@ -301,6 +316,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
             symbol, current_price, short_score, win_rate, news_info, pattern, divergence, breakout
         ));
     }
+    println!("[{}] Skipped: Score too low (L:{}, S:{})", symbol, long_score, short_score);
     None
 }
 
@@ -319,7 +335,6 @@ async fn main() {
 
     println!("🔍 Final Master Bot Running...");
 
-    // Crypto
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -331,7 +346,6 @@ async fn main() {
         }
     }
 
-    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
