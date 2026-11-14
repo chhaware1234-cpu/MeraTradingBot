@@ -22,7 +22,7 @@ struct Candle {
 
 #[derive(Serialize, Deserialize, Default)]
 struct SignalCache {
-    signals: HashMap<String, u64>, // Format: "BTCUSDT_LONG" -> timestamp
+    signals: HashMap<String, u64>,
 }
 
 // 1. Kraken Fetching
@@ -56,7 +56,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
                                     }
                                 }
                             }
-                            candles.pop(); // Drop incomplete
+                            candles.pop();
                             if candles.len() > 200 { return candles[candles.len() - 200..].to_vec(); }
                             return candles;
                         }
@@ -68,7 +68,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
     vec![]
 }
 
-// 2. Yahoo Fetching (Fixed Timestamp Pop)
+// 2. Yahoo Fetching
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let range = if interval == "1h" { "1mo" } else { "5d" };
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
@@ -95,7 +95,6 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
                             }
                         }
                         
-                        // Timestamp based pop (agar last candle incomplete hai)
                         if let Some((last_ts, _)) = candles.last() {
                             let now = Utc::now().timestamp();
                             let interval_secs = if interval == "1h" { 3600 } else { 300 };
@@ -147,31 +146,24 @@ fn detect_pattern(candles: &[Candle]) -> &'static str {
     "None"
 }
 
-// Fixed: Swing Points based Divergence
 fn detect_divergence(candles: &[Candle], rsi_values: &[f64]) -> &'static str {
     if candles.len() < 35 || rsi_values.len() < 35 { return "None"; }
     let len = candles.len();
     let current_rsi = rsi_values[len - 1];
 
-    // Bullish Divergence
     let old_low = candles[len - 35..len - 10].iter().map(|c| c.low).fold(f64::MAX, f64::min);
     let old_rsi_low = rsi_values[len - 35..len - 10].iter().fold(f64::MAX, |a, &b| a.min(b));
     let recent_low = candles[len - 5..len].iter().map(|c| c.low).fold(f64::MAX, f64::min);
     let recent_rsi_low = rsi_values[len - 5..len].iter().fold(f64::MAX, |a, &b| a.min(b));
 
-    if recent_low < old_low && recent_rsi_low > old_rsi_low && current_rsi < 45.0 {
-        return "Bullish Divergence";
-    }
+    if recent_low < old_low && recent_rsi_low > old_rsi_low && current_rsi < 45.0 { return "Bullish Divergence"; }
 
-    // Bearish Divergence
     let old_high = candles[len - 35..len - 10].iter().map(|c| c.high).fold(f64::MIN, f64::max);
     let old_rsi_high = rsi_values[len - 35..len - 10].iter().fold(f64::MIN, |a, &b| a.max(b));
     let recent_high = candles[len - 5..len].iter().map(|c| c.high).fold(f64::MIN, f64::max);
     let recent_rsi_high = rsi_values[len - 5..len].iter().fold(f64::MIN, |a, &b| a.max(b));
 
-    if recent_high > old_high && recent_rsi_high < old_rsi_high && current_rsi > 55.0 {
-        return "Bearish Divergence";
-    }
+    if recent_high > old_high && recent_rsi_high < old_rsi_high && current_rsi > 55.0 { return "Bearish Divergence"; }
 
     "None"
 }
@@ -257,13 +249,11 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     Some((long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio, latest_atr))
 }
 
-// Crypto News (Printing label for verification)
 async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
     let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
     let mut pos = 0; let mut neg = 0;
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(json) = resp.json::<Value>().await {
-            // DEBUG: Print raw response once to verify field
             println!("[DEBUG] Crypto News Raw for {}: {:?}", coin, json);
             
             if let Some(label) = json.get("label").and_then(|v| v.as_str()) {
@@ -296,7 +286,7 @@ async fn analyze_asset(
     let (pos_news, neg_news) = if symbol.ends_with("USDT") {
         fetch_crypto_news(client, &symbol.replace("USDT", "")).await
     } else if symbol.ends_with(".NS") {
-        (0, 0) // Skip news for Indian Stocks
+        (0, 0) 
     } else {
         let mut pos = 0; let mut neg = 0;
         let base_symbol = symbol.split('.').next().unwrap_or(symbol).to_lowercase();
@@ -325,7 +315,6 @@ async fn analyze_asset(
     let long_score_out_of_100 = (long_score * 10).min(100);
     let short_score_out_of_100 = (short_score * 10).min(100);
 
-    // Currency Fix
     let (margin, currency_symbol) = if symbol.ends_with(".NS") {
         (5000.0, "₹")
     } else {
@@ -336,7 +325,6 @@ async fn analyze_asset(
     let qty = (margin * leverage) / current_price; 
     let qty_str = if is_crypto { format!("{:.5}", qty) } else { format!("{:.2}", qty) };
 
-    // Cooldown Check (1 hour)
     let now_ts = Utc::now().timestamp() as u64;
     let cooldown = 3600;
 
@@ -348,7 +336,6 @@ async fn analyze_asset(
 
         if (latest_rsi < 25.0 || candle_change < -1.2) && breakout != "Bearish Breakdown" { return None; }
         
-        // ATR Relaxed to 2.0x and 4.0x
         let sl = current_price + (atr * 2.0); 
         let tp = current_price - (atr * 4.0);  
         
@@ -413,12 +400,10 @@ async fn main() {
     let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
     let stock_symbols = vec!["RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F"];
 
-    // Load Cache
     let cache_path = "signal_cache.json";
     let cache_data = fs::read_to_string(cache_path).unwrap_or_else(|_| "{}".to_string());
     let mut cache: SignalCache = serde_json::from_str(&cache_data).unwrap_or_default();
 
-    // Fetch Finnhub news once
     let mut finnhub_headlines: Vec<String> = vec![];
     if !finnhub_key.is_empty() {
         let url = format!("https://finnhub.io/api/v1/news?category=general&token={}", finnhub_key);
@@ -450,24 +435,28 @@ async fn main() {
 
     for result in results {
         if let Some(msg) = result {
+            // Ownership Fix: Extract data before moving msg
+            let dir = if msg.contains("SELL SIGNAL") { "SHORT" } else { "LONG" };
+            let mut asset_name_opt = None;
+            
+            if let Some(asset_start) = msg.find("<b>Asset:</b> ") {
+                let asset_part = &msg[asset_start + 14..];
+                if let Some(end_idx) = asset_part.find('\n') {
+                    asset_name_opt = Some(asset_part[..end_idx].trim().to_string());
+                }
+            }
+
             if let Err(e) = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await {
                 eprintln!("❌ Failed to send message: {}", e);
             } else {
                 println!("✅ Signal Sent!");
-                // Parse asset name from msg to update cache
-                if let Some(asset_start) = msg.find("<b>Asset:</b> ") {
-                    let asset_part = &msg[asset_start + 14..];
-                    if let Some(end_idx) = asset_part.find('\n') {
-                        let asset_name = asset_part[..end_idx].trim();
-                        let dir = if msg.contains("SELL SIGNAL") { "SHORT" } else { "LONG" };
-                        cache.signals.insert(format!("{}_{}", asset_name, dir), now_ts);
-                    }
+                if let Some(asset_name) = asset_name_opt {
+                    cache.signals.insert(format!("{}_{}", asset_name, dir), now_ts);
                 }
             }
         }
     }
 
-    // Save Cache
     if let Ok(json_str) = serde_json::to_string_pretty(&cache) {
         let _ = fs::write(cache_path, json_str);
     }
