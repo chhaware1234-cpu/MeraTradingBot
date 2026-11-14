@@ -14,19 +14,26 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Crypto Data (Binance Alternate API - Fast & Unblocked)
+// 1. Crypto Data (CryptoCompare - Never blocked, No API Key needed)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
-    let url = format!("https://data-api.binance.vision/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
-    
+    let coin = symbol.replace("USDT", "");
+    let url = if interval == "1h" {
+        format!("https://min-api.cryptocompare.com/data/v2/histohour?fsym={}&tsym=USD&limit={}", coin, limit)
+    } else {
+        format!("https://min-api.cryptocompare.com/data/v2/histominute?fsym={}&tsym=USD&limit={}&interval=15", coin, limit)
+    };
+
     if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(data) = resp.json::<Vec<Vec<Value>>>().await {
-            return data.iter().map(|k| Candle {
-                open: k[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                high: k[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                low: k[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                close: k[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                volume: k[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-            }).collect();
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(data) = json["Data"]["Data"].as_array() {
+                return data.iter().map(|k| Candle {
+                    open: k["open"].as_f64().unwrap_or(0.0),
+                    high: k["high"].as_f64().unwrap_or(0.0),
+                    low: k["low"].as_f64().unwrap_or(0.0),
+                    close: k["close"].as_f64().unwrap_or(0.0),
+                    volume: k["volumefrom"].as_f64().unwrap_or(0.0),
+                }).collect();
+            }
         }
     }
     vec![]
@@ -34,7 +41,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limi
 
 // 2. Stocks/Gold Data (Yahoo Finance)
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = "5d"; // Data gap fix
+    let range = "5d";
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
     
     let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
@@ -107,7 +114,7 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
 
 // 4. Confluence Scoring
 fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String) {
-    if candles_1h.len() < 50 || candles_15m.len() < 30 { return (0, 0, "".to_string(), "".to_string(), "".to_string()); }
+    if candles_1h.len() < 30 || candles_15m.len() < 20 { return (0, 0, "".to_string(), "".to_string(), "".to_string()); }
 
     let mut ema_50_1h = ExponentialMovingAverage::new(50).unwrap();
     let mut trend_ema = 0.0;
@@ -159,7 +166,7 @@ fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news
     (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
 }
 
-// 5. News Sentiment (Crypto: Free API | Stocks: Finnhub)
+// 5. News Sentiment
 async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) -> (i32, i32) {
     let mut positive_news = 0;
     let mut negative_news = 0;
@@ -220,8 +227,9 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
         )
     };
 
-    if candles_1h.len() < 50 || candles_15m.len() < 30 { 
-        println!("[{}] Skipped: Not enough data.", symbol);
+    // Weekend ke liye data condition relax kar di hai
+    if candles_1h.len() < 30 || candles_15m.len() < 20 { 
+        println!("[{}] Skipped: Not enough data (1h: {}, 15m: {}).", symbol, candles_1h.len(), candles_15m.len());
         return None; 
     }
 
@@ -233,7 +241,6 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
                     else if neg_news > 0 { format!("Negative ({})", neg_news) } 
                     else { "Neutral".to_string() };
 
-    // Score threshold is 6
     if long_score >= 6 && long_score > short_score {
         return Some(format!(
             "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
@@ -261,9 +268,8 @@ async fn main() {
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Live Scanner Running (No Backtest)...");
+    println!("🔍 Global Scanner Running...");
 
-    // Crypto
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -275,7 +281,6 @@ async fn main() {
         }
     }
 
-    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
