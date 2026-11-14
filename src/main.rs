@@ -14,6 +14,7 @@ struct Candle {
     volume: f64,
 }
 
+// 1. Binance se Crypto Data Fetch
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
     let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
     if let Ok(resp) = client.get(&url).send().await {
@@ -30,6 +31,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limi
     vec![]
 }
 
+// 2. Yahoo Finance se Stocks/Gold Data Fetch
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let range = if interval == "1h" { "5d" } else { "2d" };
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
@@ -60,6 +62,7 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
     vec![]
 }
 
+// 3. Indicators & Logic Helpers
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -153,6 +156,7 @@ fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news
     (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
 }
 
+// 4. Backtesting Engine (Win Rate Calculator)
 fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     if candles_15m.len() < 100 { return 0.0; }
     let mut wins = 0;
@@ -169,9 +173,8 @@ fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
         let mut is_long = false;
         let mut has_trade = false;
 
-        // TESTING KE LIYE SCORE 4 KIYA GAYA HAI
-        if long_score >= 4 && long_score > short_score { is_long = true; has_trade = true; }
-        else if short_score >= 4 && short_score > long_score { is_long = false; has_trade = true; }
+        if long_score >= 6 && long_score > short_score { is_long = true; has_trade = true; }
+        else if short_score >= 6 && short_score > long_score { is_long = false; has_trade = true; }
 
         if has_trade {
             let mut hit_tp = false;
@@ -196,6 +199,7 @@ fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
     (wins as f64 / (wins + losses) as f64) * 100.0
 }
 
+// 5. News Sentiment (Finnhub)
 async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &str) -> (i32, i32) {
     if api_key.is_empty() { return (0, 0); }
     let category = if symbol.ends_with("USDT") { "crypto" } else { "general" };
@@ -228,6 +232,7 @@ async fn fetch_finnhub_news_sentiment(client: &Client, symbol: &str, api_key: &s
     (positive_news, negative_news)
 }
 
+// 6. Core Analysis & Filter
 async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
     let (candles_1h, candles_15m) = if is_crypto {
         tokio::join!(
@@ -243,14 +248,15 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
 
     if candles_1h.len() < 50 || candles_15m.len() < 100 { return None; }
 
+    // Backtest Filter
     let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
     println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
 
-    // TESTING KE LIYE WIN RATE FILTER OFF (0.0) KIYA GAYA HAI
-    if win_rate < 0.0 {
-        return None; 
+    if win_rate < 30.0 {
+        return None; // Strategy is not working on this coin right now
     }
 
+    // Live Scoring
     let (pos_news, neg_news) = fetch_finnhub_news_sentiment(client, symbol, finnhub_key).await;
     let (long_score, short_score, pattern, divergence, breakout) = get_scores(&candles_1h, &candles_15m, pos_news * 2, neg_news * 2);
     let current_price = candles_15m.last().unwrap().close;
@@ -259,13 +265,12 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
                     else if neg_news > 0 { format!("Negative ({})", neg_news) } 
                     else { "Neutral".to_string() };
 
-    // TESTING KE LIYE SCORE 4 KIYA GAYA HAI
-    if long_score >= 4 && long_score > short_score {
+    if long_score >= 6 && long_score > short_score {
         return Some(format!(
             "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, long_score, win_rate, news_info, pattern, divergence, breakout
         ));
-    } else if short_score >= 4 && short_score > long_score {
+    } else if short_score >= 6 && short_score > long_score {
         return Some(format!(
             "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
             symbol, current_price, short_score, win_rate, news_info, pattern, divergence, breakout
@@ -282,20 +287,15 @@ async fn main() {
     let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
     let client = Client::new();
     
+    // Aap yahan apne pasand ke coins aur stocks add/remove kar sakte hain
     let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
     let stock_symbols = vec![
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Running Mini-Backtest & Live Scan...");
+    println!("🔍 Running Final Bot: Mini-Backtest & Live Scan...");
 
-    // ====================================================
-    // TEST MESSAGE (Yahan maine ise sahi jagah par daala hai)
-    // ====================================================
-    let _ = bot.send_message(chat_id.clone(), "🟢 <b>TEST SIGNAL: BTCUSDT</b>\n\nEntry Price: <code>65000.00</code>\n🔥 Score: 8/10\n📊 Win Rate: 45%\n📰 News: Positive\n🚀 S/R: Bullish Breakout").parse_mode(ParseMode::Html).await;
-    println!("✅ Test Message Sent!");
-    // ====================================================
-
+    // Crypto Scan
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -307,6 +307,7 @@ async fn main() {
         }
     }
 
+    // Stocks & Commodities Scan
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
@@ -314,9 +315,9 @@ async fn main() {
     for (i, result) in join_all(stock_tasks).await.into_iter().enumerate() {
         if let Some(msg) = result {
             let _ = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await;
-            println!("✅ Stock Signal Sent: {}", stock_symbols[i]);
+            println!("✅ Stock/Commodity Signal Sent: {}", stock_symbols[i]);
         }
     }
     
     println!("✅ Scan complete.");
-        }
+}
