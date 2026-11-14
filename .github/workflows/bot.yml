@@ -2,7 +2,7 @@ name: Rust Crypto Signal Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Har 15 minute mein chalega
+    - cron: '*/15 * * * *' # Runs every 15 minutes
   workflow_dispatch: # Manual run karne ke liye
 
 jobs:
@@ -15,9 +15,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Signals
+        uses: actions/cache@v3
+        with:
+          path: signal_cache.json
+          key: signal-cache-${{ github.run_id }}
+          restore-keys: |
+            signal-cache-
+
       - name: Run Bot
         env:
           TELOXIDE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: cargo run --release
