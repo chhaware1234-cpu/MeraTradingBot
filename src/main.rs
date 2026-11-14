@@ -94,13 +94,10 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
                                 }
                             }
                         }
-                        
                         if let Some((last_ts, _)) = candles.last() {
                             let now = Utc::now().timestamp();
                             let interval_secs = if interval == "1h" { 3600 } else { 300 };
-                            if now - last_ts < interval_secs {
-                                candles.pop();
-                            }
+                            if now - last_ts < interval_secs { candles.pop(); }
                         }
                         return candles.into_iter().map(|(_, c)| c).collect();
                     }
@@ -249,16 +246,21 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     Some((long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio, latest_atr))
 }
 
+// CRYPTO NEWS FIX: Now parses the "articles" array correctly
 async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
     let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
     let mut pos = 0; let mut neg = 0;
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(json) = resp.json::<Value>().await {
-            println!("[DEBUG] Crypto News Raw for {}: {:?}", coin, json);
-            
-            if let Some(label) = json.get("label").and_then(|v| v.as_str()) {
-                match label {
-                    "bullish" => pos = 3, "bearish" => neg = 3, _ => {}
+            if let Some(articles) = json.get("articles").and_then(|v| v.as_array()) {
+                for article in articles {
+                    if let Some(sentiment) = article.get("sentiment").and_then(|v| v.as_str()) {
+                        match sentiment {
+                            "bullish" => pos += 1,
+                            "bearish" => neg += 1,
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -420,7 +422,7 @@ async fn main() {
         }
     }
 
-    println!("🔍 Pro-Scanner V5 Running (Deadlock Fixed, Cooldown Active)...");
+    println!("🔍 Pro-Scanner V6 Running (All Fixes Applied)...");
 
     let mut tasks = vec![];
     for symbol in &crypto_symbols {
@@ -435,7 +437,6 @@ async fn main() {
 
     for result in results {
         if let Some(msg) = result {
-            // Ownership Fix: Extract data before moving msg
             let dir = if msg.contains("SELL SIGNAL") { "SHORT" } else { "LONG" };
             let mut asset_name_opt = None;
             
