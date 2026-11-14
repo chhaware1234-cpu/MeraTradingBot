@@ -14,45 +14,30 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Bybit se Crypto Data Fetch (With Debug Logs)
+// 1. Crypto Data (Binance Alternate API - Fast & Unblocked)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
-    let bybit_interval = if interval == "1h" { "60" } else { "15" }; 
-    let url = format!("https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}&limit={}", symbol, bybit_interval, limit);
+    let url = format!("https://data-api.binance.vision/api/v3/klines?symbol={}&interval={}&limit={}", symbol, interval, limit);
     
     if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(json) = resp.json::<Value>().await {
-            // Debug: Agar Bybit error de raha hai
-            if json["retCode"].as_i64() != Some(0) {
-                println!("[{}] Bybit API Error: {:?}", symbol, json["retMsg"]);
-                return vec![];
-            }
-            if let Some(list) = json["result"]["list"].as_array() {
-                let mut candles = vec![];
-                for k in list.iter().rev() {
-                    if let Some(arr) = k.as_array() {
-                        candles.push(Candle {
-                            open: arr[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                            high: arr[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                            low: arr[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                            close: arr[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                            volume: arr[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
-                        });
-                    }
-                }
-                return candles;
-            }
+        if let Ok(data) = resp.json::<Vec<Vec<Value>>>().await {
+            return data.iter().map(|k| Candle {
+                open: k[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                high: k[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                low: k[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                close: k[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                volume: k[5].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+            }).collect();
         }
     }
     vec![]
 }
 
-// 2. Yahoo Finance se Stocks/Gold Data Fetch
+// 2. Stocks/Gold Data (Yahoo Finance)
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = if interval == "1h" { "5d" } else { "2d" };
+    let range = "5d"; // Data gap fix
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
     
-    // Yahoo block na kare isliye proper User-Agent
-    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36").send().await;
+    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
     
     if let Ok(resp) = req {
         if let Ok(json) = resp.json::<Value>().await {
@@ -73,17 +58,13 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
                         return candles;
                     }
                 }
-            } else {
-                println!("[{}] Yahoo Finance data not found.", symbol);
             }
         }
-    } else {
-        println!("[{}] Yahoo Finance request failed.", symbol);
     }
     vec![]
 }
 
-// 3. Indicators & Logic Helpers
+// 3. Indicators & Patterns
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -124,6 +105,7 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     "None"
 }
 
+// 4. Confluence Scoring
 fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news_neg: i32) -> (i32, i32, String, String, String) {
     if candles_1h.len() < 50 || candles_15m.len() < 30 { return (0, 0, "".to_string(), "".to_string(), "".to_string()); }
 
@@ -177,50 +159,7 @@ fn get_scores(candles_1h: &[Candle], candles_15m: &[Candle], news_pos: i32, news
     (long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string())
 }
 
-// 4. Backtesting Engine
-fn calculate_win_rate(candles_1h: &[Candle], candles_15m: &[Candle]) -> f64 {
-    if candles_15m.len() < 100 { return 0.0; }
-    let mut wins = 0;
-    let mut losses = 0;
-    let lookback = 100;
-    let start_idx = candles_15m.len() - lookback;
-
-    for i in start_idx..candles_15m.len() - 10 {
-        let slice_15m = &candles_15m[0..i];
-        let slice_1h = &candles_1h[0..candles_1h.len()]; 
-        
-        let (long_score, short_score, _, _, _) = get_scores(slice_1h, slice_15m, 0, 0);
-        let entry_price = candles_15m[i].close;
-        let mut is_long = false;
-        let mut has_trade = false;
-
-        if long_score >= 6 && long_score > short_score { is_long = true; has_trade = true; }
-        else if short_score >= 6 && short_score > long_score { is_long = false; has_trade = true; }
-
-        if has_trade {
-            let mut hit_tp = false;
-            let mut hit_sl = false;
-            for j in 1..=10 {
-                if i + j >= candles_15m.len() { break; }
-                let future_candle = &candles_15m[i + j];
-
-                if is_long {
-                    if future_candle.high >= entry_price * 1.02 { hit_tp = true; break; }
-                    if future_candle.low <= entry_price * 0.99 { hit_sl = true; break; }
-                } else {
-                    if future_candle.low <= entry_price * 0.98 { hit_tp = true; break; }
-                    if future_candle.high >= entry_price * 1.01 { hit_sl = true; break; }
-                }
-            }
-            if hit_tp { wins += 1; }
-            else if hit_sl { losses += 1; }
-        }
-    }
-    if wins + losses == 0 { return 0.0; }
-    (wins as f64 / (wins + losses) as f64) * 100.0
-}
-
-// 5. News Sentiment
+// 5. News Sentiment (Crypto: Free API | Stocks: Finnhub)
 async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) -> (i32, i32) {
     let mut positive_news = 0;
     let mut negative_news = 0;
@@ -267,7 +206,7 @@ async fn fetch_news_sentiment(client: &Client, symbol: &str, finnhub_key: &str) 
     (positive_news, negative_news)
 }
 
-// 6. Core Analysis
+// 6. Live Analysis
 async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_key: &str) -> Option<String> {
     let (candles_1h, candles_15m) = if is_crypto {
         tokio::join!(
@@ -281,19 +220,8 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
         )
     };
 
-    // DEBUG: Data aaya ya nahi?
-    println!("[{}] Data Fetched: 1h: {}, 15m: {}", symbol, candles_1h.len(), candles_15m.len());
-
-    if candles_1h.len() < 50 || candles_15m.len() < 100 { 
+    if candles_1h.len() < 50 || candles_15m.len() < 30 { 
         println!("[{}] Skipped: Not enough data.", symbol);
-        return None; 
-    }
-
-    let win_rate = calculate_win_rate(&candles_1h, &candles_15m);
-    println!("[{}] Backtest Win Rate: {:.2}%", symbol, win_rate);
-
-    if win_rate < 30.0 {
-        println!("[{}] Skipped: Win rate below 30%.", symbol);
         return None; 
     }
 
@@ -305,18 +233,18 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
                     else if neg_news > 0 { format!("Negative ({})", neg_news) } 
                     else { "Neutral".to_string() };
 
+    // Score threshold is 6
     if long_score >= 6 && long_score > short_score {
         return Some(format!(
-            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, long_score, win_rate, news_info, pattern, divergence, breakout
+            "🟢 <b>NEW LONG ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            symbol, current_price, long_score, news_info, pattern, divergence, breakout
         ));
     } else if short_score >= 6 && short_score > long_score {
         return Some(format!(
-            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📊 Win Rate: <b>{:.1}%</b>\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
-            symbol, current_price, short_score, win_rate, news_info, pattern, divergence, breakout
+            "🔴 <b>NEW SHORT ENTRY: {}</b>\n\nEntry Price: <code>{:.2}</code>\n🔥 Score: {}/10\n📰 News: {}\n🕯️ Pattern: {}\n⚡ Divergence: {}\n🚀 S/R: {}",
+            symbol, current_price, short_score, news_info, pattern, divergence, breakout
         ));
     }
-    println!("[{}] Skipped: Score too low (L:{}, S:{})", symbol, long_score, short_score);
     None
 }
 
@@ -333,8 +261,9 @@ async fn main() {
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Final Master Bot Running...");
+    println!("🔍 Live Scanner Running (No Backtest)...");
 
+    // Crypto
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
         crypto_tasks.push(analyze_asset(&client, symbol, true, &finnhub_key));
@@ -346,6 +275,7 @@ async fn main() {
         }
     }
 
+    // Stocks
     let mut stock_tasks = vec![];
     for symbol in &stock_symbols {
         stock_tasks.push(analyze_asset(&client, symbol, false, &finnhub_key));
