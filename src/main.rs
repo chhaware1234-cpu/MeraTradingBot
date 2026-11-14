@@ -14,25 +14,46 @@ struct Candle {
     volume: f64,
 }
 
-// 1. Crypto Data (CryptoCompare - Never blocked, No API Key needed)
-async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, limit: u32) -> Vec<Candle> {
-    let coin = symbol.replace("USDT", "");
-    let url = if interval == "1h" {
-        format!("https://min-api.cryptocompare.com/data/v2/histohour?fsym={}&tsym=USD&limit={}", coin, limit)
-    } else {
-        format!("https://min-api.cryptocompare.com/data/v2/histominute?fsym={}&tsym=USD&limit={}&interval=15", coin, limit)
+// 1. Crypto Data (Kraken API - 100% Unblocked on GitHub)
+async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str, _limit: u32) -> Vec<Candle> {
+    // Kraken ke symbols alag hote hain
+    let pair = match symbol {
+        "BTCUSDT" => "XBTUSD",
+        "ETHUSDT" => "ETHUSD",
+        "SOLUSDT" => "SOLUSD",
+        _ => "XBTUSD",
     };
+    let kraken_interval = if interval == "1h" { "60" } else { "15" };
+    let url = format!("https://api.kraken.com/0/public/OHLC?pair={}&interval={}", pair, kraken_interval);
 
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(json) = resp.json::<Value>().await {
-            if let Some(data) = json["Data"]["Data"].as_array() {
-                return data.iter().map(|k| Candle {
-                    open: k["open"].as_f64().unwrap_or(0.0),
-                    high: k["high"].as_f64().unwrap_or(0.0),
-                    low: k["low"].as_f64().unwrap_or(0.0),
-                    close: k["close"].as_f64().unwrap_or(0.0),
-                    volume: k["volumefrom"].as_f64().unwrap_or(0.0),
-                }).collect();
+            if let Some(result_obj) = json["result"].as_object() {
+                // Kraken result object ke andar dynamic key hoti hai (jaise XXBTZUSD)
+                for (key, value) in result_obj {
+                    if key != "last" {
+                        if let Some(arr) = value.as_array() {
+                            let mut candles = vec![];
+                            for k in arr {
+                                if let Some(c) = k.as_array() {
+                                    // Kraken Format: [time, open, high, low, close, vwap, volume, count]
+                                    candles.push(Candle {
+                                        open: c[1].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                                        high: c[2].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                                        low: c[3].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                                        close: c[4].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                                        volume: c[6].as_str().unwrap_or("0").parse().unwrap_or(0.0),
+                                    });
+                                }
+                            }
+                            // Kraken 720 candles deta hai, hum last 200 le lenge
+                            if candles.len() > 200 {
+                                return candles[candles.len() - 200..].to_vec();
+                            }
+                            return candles;
+                        }
+                    }
+                }
             }
         }
     }
@@ -227,9 +248,10 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
         )
     };
 
-    // Weekend ke liye data condition relax kar di hai
+    println!("[{}] Data Fetched: 1h: {}, 15m: {}", symbol, candles_1h.len(), candles_15m.len());
+
     if candles_1h.len() < 30 || candles_15m.len() < 20 { 
-        println!("[{}] Skipped: Not enough data (1h: {}, 15m: {}).", symbol, candles_1h.len(), candles_15m.len());
+        println!("[{}] Skipped: Not enough data.", symbol);
         return None; 
     }
 
@@ -252,6 +274,7 @@ async fn analyze_asset(client: &Client, symbol: &str, is_crypto: bool, finnhub_k
             symbol, current_price, short_score, news_info, pattern, divergence, breakout
         ));
     }
+    println!("[{}] Skipped: Score too low (L:{}, S:{})", symbol, long_score, short_score);
     None
 }
 
@@ -268,7 +291,7 @@ async fn main() {
         "RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F" 
     ];
 
-    println!("🔍 Global Scanner Running...");
+    println!("🔍 Kraken-Powered Scanner Running...");
 
     let mut crypto_tasks = vec![];
     for symbol in &crypto_symbols {
