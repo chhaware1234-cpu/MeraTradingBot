@@ -285,8 +285,8 @@ fn build_signal(asset: &Asset, entry: &[Candle], trend: &[Candle], btc_bullish: 
 
     let last = entry.last()?;
     let prev = &entry[entry.len()-2];
-    let uptrend = trend_closes.last()? > ema50;
-    let downtrend = trend_closes.last()? < ema50;
+    let uptrend = *trend_closes.last()? > ema50;
+    let downtrend = *trend_closes.last()? < ema50;
     let vr = volume_ratio(entry, 20);
     
     let rsi_values: Vec<f64> = (0..closes.len())
@@ -325,7 +325,7 @@ fn build_signal(asset: &Asset, entry: &[Candle], trend: &[Candle], btc_bullish: 
     if vr >= 1.5 && last.close < last.open { short += 1; }
 
     // BTC Macro Filter
-    if asset.kind == AssetKind::Crypto as i32 && asset.symbol != "BTCUSDT" {
+    if asset.kind == AssetKind::Crypto as && asset.symbol != "BTCUSDT" {
         if let Some(is_btc_bull) = btc_bullish {
             if long >= 6 && !is_btc_bull { long -= 5; }
             if short >= 6 && is_btc_bull { short -= 5; }
