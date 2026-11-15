@@ -25,7 +25,7 @@ struct SignalCache {
     signals: HashMap<String, u64>,
 }
 
-// 1. Kraken Fetching
+// 1. Kraken Fetching (Supports 1d, 4h, 1h, 15m, 5m)
 async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
     let pair = match symbol {
         "BTCUSDT" => "XBTUSD",
@@ -33,7 +33,13 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
         "SOLUSDT" => "SOLUSD",
         _ => return vec![],
     };
-    let kraken_interval = if interval == "1h" { "60" } else { "5" };
+    let kraken_interval = match interval {
+        "1d" => "1440",
+        "4h" => "240",
+        "1h" => "60",
+        "15m" => "15",
+        _ => "5",
+    };
     let url = format!("https://api.kraken.com/0/public/OHLC?pair={}&interval={}", pair, kraken_interval);
 
     if let Ok(resp) = client.get(&url).send().await {
@@ -56,7 +62,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
                                     }
                                 }
                             }
-                            candles.pop(); // Drop incomplete
+                            candles.pop(); 
                             if candles.len() > 200 { return candles[candles.len() - 200..].to_vec(); }
                             return candles;
                         }
@@ -70,8 +76,15 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
 
 // 2. Yahoo Fetching
 async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = if interval == "1h" { "1mo" } else { "5d" };
-    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, interval, range);
+    let range = match interval {
+        "1d" => "1y",
+        "4h" => "1mo",
+        "1h" => "1mo",
+        _ => "5d",
+    };
+    let yahoo_interval = if interval == "4h" { "1h" } else { interval };
+    
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, yahoo_interval, range);
     let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
     
     if let Ok(resp) = req {
@@ -96,7 +109,9 @@ async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Ve
                         }
                         if let Some((last_ts, _)) = candles.last() {
                             let now = Utc::now().timestamp();
-                            let interval_secs = if interval == "1h" { 3600 } else { 300 };
+                            let interval_secs = match interval {
+                                "1d" => 86400, "4h" => 14400, "1h" => 3600, "15m" => 900, _ => 300
+                            };
                             if now - last_ts < interval_secs { candles.pop(); }
                         }
                         return candles.into_iter().map(|(_, c)| c).collect();
@@ -129,6 +144,7 @@ fn is_market_open(symbol: &str) -> bool {
     true
 }
 
+// 4. Indicators & Patterns
 fn detect_pattern(candles: &[Candle]) -> &'static str {
     if candles.len() < 2 { return "None"; }
     let curr = &candles[candles.len() - 1];
@@ -161,7 +177,6 @@ fn detect_divergence(candles: &[Candle], rsi_values: &[f64]) -> &'static str {
     let recent_rsi_high = rsi_values[len - 5..len].iter().fold(f64::MIN, |a, &b| a.max(b));
 
     if recent_high > old_high && recent_rsi_high < old_rsi_high && current_rsi > 55.0 { return "Bearish Divergence"; }
-
     "None"
 }
 
@@ -176,18 +191,18 @@ fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
     "None"
 }
 
-fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_neg: i32) -> Option<(i32, i32, String, String, String, f64, f64, f64, f64)> {
-    if candles_1h.len() < 50 || candles_5m.len() < 35 { return None; }
+fn get_scores(candles_trend: &[Candle], candles_entry: &[Candle], news_pos: i32, news_neg: i32) -> Option<(i32, i32, String, String, String, f64, f64, f64, f64)> {
+    if candles_trend.len() < 50 || candles_entry.len() < 35 { return None; }
 
-    let mut ema_50_1h = ExponentialMovingAverage::new(50).unwrap();
+    let mut ema_50 = ExponentialMovingAverage::new(50).unwrap();
     let mut trend_ema = 0.0;
-    for c in candles_1h { trend_ema = ema_50_1h.next(c.close); }
-    let is_uptrend = candles_1h.last().unwrap().close > trend_ema;
-    let is_downtrend = candles_1h.last().unwrap().close < trend_ema;
+    for c in candles_trend { trend_ema = ema_50.next(c.close); }
+    let is_uptrend = candles_trend.last().unwrap().close > trend_ema;
+    let is_downtrend = candles_trend.last().unwrap().close < trend_ema;
 
-    let mut rsi_5m = RelativeStrengthIndex::new(14).unwrap();
-    let mut macd_5m = MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap();
-    let mut atr_5m = AverageTrueRange::new(14).unwrap();
+    let mut rsi = RelativeStrengthIndex::new(14).unwrap();
+    let mut macd = MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap();
+    let mut atr = AverageTrueRange::new(14).unwrap();
     
     let mut rsi_values = Vec::new();
     let mut latest_macd_hist = 0.0;
@@ -195,31 +210,31 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     let vol_period = 20;
     let mut vol_sma = 0.0;
 
-    for c in candles_5m.iter() {
-        rsi_values.push(rsi_5m.next(c.close));
-        latest_macd_hist = macd_5m.next(c.close).histogram;
+    for c in candles_entry.iter() {
+        rsi_values.push(rsi.next(c.close));
+        latest_macd_hist = macd.next(c.close).histogram;
         if let Ok(item) = ta::DataItem::builder().open(c.open).high(c.high).low(c.low).close(c.close).volume(c.volume).build() {
-            latest_atr = atr_5m.next(&item);
+            latest_atr = atr.next(&item);
         }
     }
 
     if latest_atr <= 0.0 { return None; }
 
-    for i in (candles_5m.len() - vol_period - 1)..(candles_5m.len() - 1) {
-        vol_sma += candles_5m[i].volume;
+    for i in (candles_entry.len() - vol_period - 1)..(candles_entry.len() - 1) {
+        vol_sma += candles_entry[i].volume;
     }
     vol_sma /= vol_period as f64;
 
-    let current_vol = candles_5m.last().unwrap().volume;
+    let current_vol = candles_entry.last().unwrap().volume;
     let vol_ratio = if vol_sma > 0.0 { current_vol / vol_sma } else { 1.0 };
     let high_volume = vol_ratio > 1.5; 
     
-    let pattern = detect_pattern(candles_5m);
-    let divergence = detect_divergence(candles_5m, &rsi_values);
-    let breakout = detect_sr_breakout(candles_5m);
+    let pattern = detect_pattern(candles_entry);
+    let divergence = detect_divergence(candles_entry, &rsi_values);
+    let breakout = detect_sr_breakout(candles_entry);
     let latest_rsi = *rsi_values.last().unwrap();
 
-    let current_candle = candles_5m.last().unwrap();
+    let current_candle = candles_entry.last().unwrap();
     let candle_change_percent = ((current_candle.close - current_candle.open) / current_candle.open) * 100.0;
 
     let mut long_score = 0;
@@ -255,6 +270,7 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     Some((long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio, latest_atr))
 }
 
+// 5. News Fetching
 async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
     let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
     let mut pos = 0; let mut neg = 0;
@@ -276,6 +292,7 @@ async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
     (pos, neg)
 }
 
+// 6. Main Analysis Function
 async fn analyze_asset(
     client: &Client, 
     symbol: &str, 
@@ -283,16 +300,23 @@ async fn analyze_asset(
     finnhub_headlines: &[String],
     cache: &SignalCache,
     btc_bullish: Option<bool>,
+    strategy: &str,
 ) -> Option<String> {
     if !is_market_open(symbol) { return None; }
 
-    let (candles_1h, candles_5m) = if is_crypto {
-        tokio::join!(fetch_crypto_klines(client, symbol, "1h"), fetch_crypto_klines(client, symbol, "5m"))
-    } else {
-        tokio::join!(fetch_yahoo_klines(client, symbol, "1h"), fetch_yahoo_klines(client, symbol, "5m"))
+    let (trend_tf, entry_tf) = match strategy {
+        "INTRADAY" => ("4h", "15m"),
+        "SWING" => ("1d", "1h"),
+        _ => ("1h", "5m"),
     };
 
-    if candles_1h.len() < 50 || candles_5m.len() < 35 { return None; }
+    let (candles_trend, candles_entry) = if is_crypto {
+        tokio::join!(fetch_crypto_klines(client, symbol, trend_tf), fetch_crypto_klines(client, symbol, entry_tf))
+    } else {
+        tokio::join!(fetch_yahoo_klines(client, symbol, trend_tf), fetch_yahoo_klines(client, symbol, entry_tf))
+    };
+
+    if candles_trend.len() < 50 || candles_entry.len() < 35 { return None; }
 
     let (pos_news, neg_news) = if symbol.ends_with("USDT") {
         fetch_crypto_news(client, &symbol.replace("USDT", "")).await
@@ -318,20 +342,15 @@ async fn analyze_asset(
     };
 
     let (long_score, short_score, pattern, _divergence, _breakout, latest_rsi, candle_change, vol_ratio, atr) = 
-        get_scores(&candles_1h, &candles_5m, pos_news, neg_news)?;
+        get_scores(&candles_trend, &candles_entry, pos_news, neg_news)?;
     
-    let current_price = candles_5m.last().unwrap().close;
+    let current_price = candles_entry.last().unwrap().close;
     let asset_name = symbol.replace("USDT", "").replace(".NS", "");
 
     let long_score_out_of_100 = (long_score * 10).min(100).max(0);
     let short_score_out_of_100 = (short_score * 10).min(100).max(0);
 
-    let (margin, currency_symbol) = if symbol.ends_with(".NS") {
-        (5000.0, "₹")
-    } else {
-        (50.0, "$")
-    };
-    
+    let (margin, currency_symbol) = if symbol.ends_with(".NS") { (5000.0, "₹") } else { (50.0, "$") };
     let leverage = 10.0; 
     let qty = (margin * leverage) / current_price; 
     let qty_str = if is_crypto { format!("{:.5}", qty) } else { format!("{:.2}", qty) };
@@ -339,34 +358,29 @@ async fn analyze_asset(
     let now_ts = Utc::now().timestamp() as u64;
     let cooldown = 3600;
 
-    // BTC MACRO FILTER
     if is_crypto && symbol != "BTCUSDT" && long_score >= 7 && long_score > short_score {
-        if let Some(is_btc_bull) = btc_bullish {
-            if !is_btc_bull { return None; }
-        }
+        if let Some(is_btc_bull) = btc_bullish { if !is_btc_bull { return None; } }
     }
     if is_crypto && symbol != "BTCUSDT" && short_score >= 7 && short_score > long_score {
-        if let Some(is_btc_bull) = btc_bullish {
-            if is_btc_bull { return None; }
-        }
+        if let Some(is_btc_bull) = btc_bullish { if is_btc_bull { return None; } }
     }
 
     if short_score >= 7 && short_score > long_score {
-        let cache_key = format!("{}_SHORT", asset_name);
-        if let Some(&last_ts) = cache.signals.get(&cache_key) {
-            if now_ts - last_ts < cooldown { return None; }
-        }
-
+        let cache_key = format!("{}_{}_SHORT", asset_name, strategy);
+        if let Some(&last_ts) = cache.signals.get(&cache_key) { if now_ts - last_ts < cooldown { return None; } }
         if latest_rsi < 25.0 || candle_change < -1.2 { return None; }
         
-        let sl = current_price + (atr * 2.0); 
-        let tp = current_price - (atr * 4.0);  
+        let sl_mult = if strategy == "SWING" { 3.0 } else if strategy == "INTRADAY" { 2.5 } else { 2.0 };
+        let tp_mult = if strategy == "SWING" { 6.0 } else if strategy == "INTRADAY" { 5.0 } else { 4.0 };
+
+        let sl = current_price + (atr * sl_mult); 
+        let tp = current_price - (atr * tp_mult);  
         
         return Some(format!(
             "🔴 <b>SELL SIGNAL (SHORT)</b> 🔴\n\
             ━━━━━━━━━━━━━━━━━━━━\n\
             🌍 <b>Asset:</b> {}\n\
-            ⏰ <b>Type:</b> SCALPING (5m)\n\
+            ⏰ <b>Type:</b> {} ({} Entry)\n\
             ━━━━━━━━━━━━━━━━━━━━\n\
             💵 <b>Price:</b> <code>{:.4}</code>\n\
             🛑 <b>SL:</b> <code>{:.4}</code>\n\
@@ -376,24 +390,24 @@ async fn analyze_asset(
             🚀 <b>Qty:</b> {} (Margin: {}{:.0}, 10x)\n\
             📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
             📰 <b>News:</b> {}",
-            asset_name, current_price, sl, tp, short_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if neg_news > 0 { "Negative" } else { "Neutral" }
+            asset_name, strategy, entry_tf, current_price, sl, tp, short_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if neg_news > 0 { "Negative" } else { "Neutral" }
         ));
     } else if long_score >= 7 && long_score > short_score {
-        let cache_key = format!("{}_LONG", asset_name);
-        if let Some(&last_ts) = cache.signals.get(&cache_key) {
-            if now_ts - last_ts < cooldown { return None; }
-        }
-
+        let cache_key = format!("{}_{}_LONG", asset_name, strategy);
+        if let Some(&last_ts) = cache.signals.get(&cache_key) { if now_ts - last_ts < cooldown { return None; } }
         if latest_rsi > 75.0 || candle_change > 1.2 { return None; }
 
-        let sl = current_price - (atr * 2.0); 
-        let tp = current_price + (atr * 4.0);  
+        let sl_mult = if strategy == "SWING" { 3.0 } else if strategy == "INTRADAY" { 2.5 } else { 2.0 };
+        let tp_mult = if strategy == "SWING" { 6.0 } else if strategy == "INTRADAY" { 5.0 } else { 4.0 };
+
+        let sl = current_price - (atr * sl_mult); 
+        let tp = current_price + (atr * tp_mult);  
 
         return Some(format!(
             "🟢 <b>BUY SIGNAL (LONG)</b> 🟢\n\
             ━━━━━━━━━━━━━━━━━━━━\n\
             🌍 <b>Asset:</b> {}\n\
-            ⏰ <b>Type:</b> SCALPING (5m)\n\
+            ⏰ <b>Type:</b> {} ({} Entry)\n\
             ━━━━━━━━━━━━━━━━━━━━\n\
             💵 <b>Price:</b> <code>{:.4}</code>\n\
             🛑 <b>SL:</b> <code>{:.4}</code>\n\
@@ -403,7 +417,7 @@ async fn analyze_asset(
             🚀 <b>Qty:</b> {} (Margin: {}{:.0}, 10x)\n\
             📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
             📰 <b>News:</b> {}",
-            asset_name, current_price, sl, tp, long_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if pos_news > 0 { "Positive" } else { "Neutral" }
+            asset_name, strategy, entry_tf, current_price, sl, tp, long_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if pos_news > 0 { "Positive" } else { "Neutral" }
         ));
     }
     None
@@ -427,7 +441,6 @@ async fn main() {
     let cache_data = fs::read_to_string(cache_path).unwrap_or_else(|_| "{}".to_string());
     let mut cache: SignalCache = serde_json::from_str(&cache_data).unwrap_or_default();
 
-    // BTC Macro Trend
     let mut btc_bullish = None;
     let btc_1h = fetch_crypto_klines(&client, "BTCUSDT", "1h").await;
     if btc_1h.len() >= 50 {
@@ -454,14 +467,18 @@ async fn main() {
         }
     }
 
-    println!("🔍 Pro-Scanner Final Version Running...");
+    println!("🔍 Multi-Timeframe Scanner Running (Scalping, Intraday, Swing)...");
 
     let mut tasks = vec![];
-    for symbol in &crypto_symbols {
-        tasks.push(analyze_asset(&client, symbol, true, &finnhub_headlines, &cache, btc_bullish));
-    }
-    for symbol in &stock_symbols {
-        tasks.push(analyze_asset(&client, symbol, false, &finnhub_headlines, &cache, None));
+    let strategies = vec!["SCALPING", "INTRADAY", "SWING"];
+
+    for strategy in strategies {
+        for symbol in &crypto_symbols {
+            tasks.push(analyze_asset(&client, symbol, true, &finnhub_headlines, &cache, btc_bullish, strategy));
+        }
+        for symbol in &stock_symbols {
+            tasks.push(analyze_asset(&client, symbol, false, &finnhub_headlines, &cache, None, strategy));
+        }
     }
 
     let results = join_all(tasks).await;
@@ -470,6 +487,7 @@ async fn main() {
     for result in results {
         if let Some(msg) = result {
             let dir = if msg.contains("SELL SIGNAL") { "SHORT" } else { "LONG" };
+            let strategy = if msg.contains("INTRADAY") { "INTRADAY" } else if msg.contains("SWING") { "SWING" } else { "SCALPING" };
             let mut asset_name_opt = None;
             
             if let Some(asset_start) = msg.find("<b>Asset:</b> ") {
@@ -484,7 +502,7 @@ async fn main() {
             } else {
                 println!("✅ Signal Sent!");
                 if let Some(asset_name) = asset_name_opt {
-                    cache.signals.insert(format!("{}_{}", asset_name, dir), now_ts);
+                    cache.signals.insert(format!("{}_{}_{}", asset_name, strategy, dir), now_ts);
                 }
             }
         }
