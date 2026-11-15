@@ -1,18 +1,19 @@
-use reqwest::Client;
-use ta::indicators::{RelativeStrengthIndex, MovingAverageConvergenceDivergence, ExponentialMovingAverage, AverageTrueRange};
-use ta::Next;
-use teloxide::{prelude::*, types::ParseMode};
-use futures::future::join_all;
-use serde_json::Value;
-use serde::{Serialize, Deserialize};
-use chrono::{Utc, Timelike, Datelike, Weekday};
-use chrono_tz::America::New_York;
-use chrono_tz::Asia::Kolkata;
-use std::fs;
-use std::collections::HashMap;
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc, Weekday};
+use chrono_tz::{America::New_York, Asia::Kolkata};
+use dotenvy::dotenv;
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, env, fs, path::Path, time::Duration as StdDuration};
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{error, info, warn};
 
-#[derive(Debug, Clone)]
+const STATE_FILE: &str = "bot_state_v2.json";
+const CYCLE_MINUTES: u64 = 15;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Candle {
+    timestamp: i64,
     open: f64,
     high: f64,
     low: f64,
@@ -20,497 +21,515 @@ struct Candle {
     volume: f64,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct SignalCache {
-    signals: HashMap<String, u64>,
+#[derive(Debug, Clone)]
+struct Asset {
+    symbol: &'static str,
+    kind: AssetKind,
+    strategy: Strategy,
 }
 
-// 1. Kraken Fetching (Supports 1d, 4h, 1h, 15m, 5m)
-async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let pair = match symbol {
-        "BTCUSDT" => "XBTUSD",
-        "ETHUSDT" => "ETHUSD",
-        "SOLUSDT" => "SOLUSD",
-        _ => return vec![],
-    };
-    let kraken_interval = match interval {
-        "1d" => "1440",
-        "4h" => "240",
-        "1h" => "60",
-        "15m" => "15",
-        _ => "5",
-    };
-    let url = format!("https://api.kraken.com/0/public/OHLC?pair={}&interval={}", pair, kraken_interval);
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AssetKind { Crypto, India, Us, Metal }
 
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(json) = resp.json::<Value>().await {
-            if let Some(result_obj) = json["result"].as_object() {
-                for (key, value) in result_obj {
-                    if key != "last" {
-                        if let Some(arr) = value.as_array() {
-                            let mut candles = vec![];
-                            for k in arr {
-                                if let Some(c) = k.as_array() {
-                                    if c.len() >= 7 {
-                                        candles.push(Candle {
-                                            open: c.get(1).and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0),
-                                            high: c.get(2).and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0),
-                                            low: c.get(3).and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0),
-                                            close: c.get(4).and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0),
-                                            volume: c.get(6).and_then(|v| v.as_str()).unwrap_or("0").parse().unwrap_or(0.0),
-                                        });
-                                    }
-                                }
-                            }
-                            candles.pop(); 
-                            if candles.len() > 200 { return candles[candles.len() - 200..].to_vec(); }
-                            return candles;
-                        }
-                    }
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Strategy { Scalping, Intraday, Swing }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BotState {
+    last_signal: HashMap<String, i64>,
+    paper_trades: Vec<PaperTrade>,
+    day_key: String,
+    daily_realized_r: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaperTrade {
+    id: String,
+    symbol: String,
+    side: String,
+    entry: f64,
+    stop: f64,
+    target: f64,
+    quantity: f64,
+    risk_amount: f64,
+    opened_at: i64,
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct Signal {
+    symbol: String,
+    side: String,
+    strategy: String,
+    price: f64,
+    stop: f64,
+    target: f64,
+    quantity: f64,
+    risk_amount: f64,
+    score: i32,
+    rsi: f64,
+    atr: f64,
+    volume_ratio: f64,
+    reason: String,
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    env::var(key).ok().and_then(|v| v.parse().ok()).filter(|v: &f64| v.is_finite()).unwrap_or(default)
+}
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn valid_candles(c: &[Candle]) -> bool {
+    c.len() >= 60 && c.iter().all(|x|
+        x.open.is_finite() && x.high.is_finite() && x.low.is_finite() &&
+        x.close.is_finite() && x.volume.is_finite() &&
+        x.open > 0.0 && x.close > 0.0 && x.high >= x.low &&
+        x.high >= x.open.max(x.close) && x.low <= x.open.min(x.close) && x.volume >= 0.0
+    )
+}
+
+async fn get_json(client: &Client, url: &str) -> Result<serde_json::Value> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                return resp.json::<serde_json::Value>().await.context("invalid JSON response");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                last_error = Some(anyhow!("HTTP {}: {}", status, body.chars().take(200).collect::<String>()));
+                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    tokio::time::sleep(StdDuration::from_millis(500 * (attempt + 1))).await;
+                    continue;
                 }
+                break;
+            }
+            Err(e) => {
+                last_error = Some(anyhow!(e));
+                tokio::time::sleep(StdDuration::from_millis(500 * (attempt + 1))).await;
             }
         }
     }
-    vec![]
+    Err(last_error.unwrap_or_else(|| anyhow!("request failed")))
 }
 
-// 2. Yahoo Fetching
-async fn fetch_yahoo_klines(client: &Client, symbol: &str, interval: &str) -> Vec<Candle> {
-    let range = match interval {
-        "1d" => "1y",
-        "4h" => "1mo",
-        "1h" => "1mo",
-        _ => "5d",
-    };
-    let yahoo_interval = if interval == "4h" { "1h" } else { interval };
-    
-    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", symbol, yahoo_interval, range);
-    let req = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await;
-    
-    if let Ok(resp) = req {
-        if let Ok(json) = resp.json::<Value>().await {
-            if let Some(result) = json["chart"]["result"].as_array() {
-                if let Some(data) = result.get(0) {
-                    if let Some(quote) = data["indicators"]["quote"].as_array().and_then(|a| a.get(0)) {
-                        let mut candles = vec![];
-                        if let (Some(o), Some(h), Some(l), Some(c), Some(v), Some(t)) = (
-                            quote["open"].as_array(), quote["high"].as_array(), quote["low"].as_array(), quote["close"].as_array(), quote["volume"].as_array(), data["timestamp"].as_array()
-                        ) {
-                            for i in 0..c.len() {
-                                if let (Some(open), Some(high), Some(low), Some(close)) = (
-                                    o.get(i).and_then(|x| x.as_f64()), h.get(i).and_then(|x| x.as_f64()),
-                                    l.get(i).and_then(|x| x.as_f64()), c.get(i).and_then(|x| x.as_f64()),
-                                ) {
-                                    let volume = v.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    let ts = t.get(i).and_then(|x| x.as_i64()).unwrap_or(0);
-                                    candles.push((ts, Candle { open, high, low, close, volume }));
-                                }
-                            }
-                        }
-                        if let Some((last_ts, _)) = candles.last() {
-                            let now = Utc::now().timestamp();
-                            let interval_secs = match interval {
-                                "1d" => 86400, "4h" => 14400, "1h" => 3600, "15m" => 900, _ => 300
-                            };
-                            if now - last_ts < interval_secs { candles.pop(); }
-                        }
-                        return candles.into_iter().map(|(_, c)| c).collect();
-                    }
-                }
-            }
-        }
+fn kraken_pair(symbol: &str) -> Option<&'static str> {
+    match symbol { "BTCUSDT" => Some("XBTUSD"), "ETHUSDT" => Some("ETHUSD"), "SOLUSDT" => Some("SOLUSD"), _ => None }
+}
+
+async fn fetch_kraken(client: &Client, symbol: &str, interval_min: u32) -> Result<Vec<Candle>> {
+    let pair = kraken_pair(symbol).ok_or_else(|| anyhow!("unsupported Kraken symbol"))?;
+    let url = format!("https://api.kraken.com/0/public/OHLC?pair={}&interval={}", pair, interval_min);
+    let json = get_json(client, &url).await?;
+    if !json["error"].as_array().unwrap_or(&vec![]).is_empty() {
+        return Err(anyhow!("Kraken returned API error"));
     }
-    vec![]
-}
-
-// 3. Market Hours
-fn is_market_open(symbol: &str) -> bool {
-    let now_utc = Utc::now();
-    if symbol.ends_with(".NS") {
-        let now_ist = now_utc.with_timezone(&Kolkata);
-        if now_ist.weekday() == Weekday::Sat || now_ist.weekday() == Weekday::Sun { return false; }
-        let mins = now_ist.hour() * 60 + now_ist.minute();
-        return mins >= (9 * 60 + 15) && mins <= (15 * 60 + 30);
-    } else if ["AAPL", "TSLA", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "NFLX", "AMD", "JPM"].contains(&symbol) {
-        let now_est = now_utc.with_timezone(&New_York);
-        if now_est.weekday() == Weekday::Sat || now_est.weekday() == Weekday::Sun { return false; }
-        let mins = now_est.hour() * 60 + now_est.minute();
-        return mins >= (9 * 60 + 30) && mins <= (16 * 60);
-    } else if symbol == "GC=F" || symbol == "SI=F" {
-        let day = now_utc.weekday();
-        if day == Weekday::Sat { return false; }
-        return true;
+    let result = json["result"].as_object().ok_or_else(|| anyhow!("missing Kraken result"))?;
+    let key = result.keys().find(|k| k.as_str() != "last").ok_or_else(|| anyhow!("missing OHLC array"))?;
+    let rows = result[key].as_array().ok_or_else(|| anyhow!("invalid OHLC array"))?;
+    let mut out = Vec::new();
+    for row in rows.iter().take(rows.len().saturating_sub(1)) {
+        let a = row.as_array().ok_or_else(|| anyhow!("invalid candle row"))?;
+        let num = |i: usize| a.get(i).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN);
+        let ts = a.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+        out.push(Candle { timestamp: ts, open: num(1), high: num(2), low: num(3), close: num(4), volume: num(6) });
     }
-    true
+    Ok(out)
 }
 
-// 4. Indicators & Patterns
-fn detect_pattern(candles: &[Candle]) -> &'static str {
-    if candles.len() < 2 { return "None"; }
-    let curr = &candles[candles.len() - 1];
-    let prev = &candles[candles.len() - 2];
-    if prev.close < prev.open && curr.close > curr.open && curr.close > prev.open && curr.open < prev.close { return "Bullish Engulfing"; }
-    if prev.close > prev.open && curr.close < curr.open && curr.close < prev.open && curr.open > prev.close { return "Bearish Engulfing"; }
-    let body = (curr.close - curr.open).abs();
-    let lower_wick = curr.open.min(curr.close) - curr.low;
-    let upper_wick = curr.high - curr.open.max(curr.close);
-    if lower_wick > body * 2.0 && upper_wick < body * 0.5 { return "Bullish Pinbar"; }
-    if upper_wick > body * 2.0 && lower_wick < body * 0.5 { return "Bearish Pinbar"; }
-    "None"
-}
-
-fn detect_divergence(candles: &[Candle], rsi_values: &[f64]) -> &'static str {
-    if candles.len() < 35 || rsi_values.len() < 35 { return "None"; }
-    let len = candles.len();
-    let current_rsi = rsi_values[len - 1];
-
-    let old_low = candles[len - 35..len - 10].iter().map(|c| c.low).fold(f64::MAX, f64::min);
-    let old_rsi_low = rsi_values[len - 35..len - 10].iter().fold(f64::MAX, |a, &b| a.min(b));
-    let recent_low = candles[len - 5..len].iter().map(|c| c.low).fold(f64::MAX, f64::min);
-    let recent_rsi_low = rsi_values[len - 5..len].iter().fold(f64::MAX, |a, &b| a.min(b));
-
-    if recent_low < old_low && recent_rsi_low > old_rsi_low && current_rsi < 45.0 { return "Bullish Divergence"; }
-
-    let old_high = candles[len - 35..len - 10].iter().map(|c| c.high).fold(f64::MIN, f64::max);
-    let old_rsi_high = rsi_values[len - 35..len - 10].iter().fold(f64::MIN, |a, &b| a.max(b));
-    let recent_high = candles[len - 5..len].iter().map(|c| c.high).fold(f64::MIN, f64::max);
-    let recent_rsi_high = rsi_values[len - 5..len].iter().fold(f64::MIN, |a, &b| a.max(b));
-
-    if recent_high > old_high && recent_rsi_high < old_rsi_high && current_rsi > 55.0 { return "Bearish Divergence"; }
-    "None"
-}
-
-fn detect_sr_breakout(candles: &[Candle]) -> &'static str {
-    if candles.len() < 25 { return "None"; }
-    let len = candles.len();
-    let current_close = candles[len - 1].close;
-    let resistance = candles[len - 21..len - 1].iter().map(|c| c.high).fold(f64::MIN, f64::max);
-    let support = candles[len - 21..len - 1].iter().map(|c| c.low).fold(f64::MAX, f64::min);
-    if current_close > resistance { return "Bullish Breakout"; }
-    else if current_close < support { return "Bearish Breakdown"; }
-    "None"
-}
-
-fn get_scores(candles_trend: &[Candle], candles_entry: &[Candle], news_pos: i32, news_neg: i32) -> Option<(i32, i32, String, String, String, f64, f64, f64, f64)> {
-    if candles_trend.len() < 50 || candles_entry.len() < 35 { return None; }
-
-    let mut ema_50 = ExponentialMovingAverage::new(50).unwrap();
-    let mut trend_ema = 0.0;
-    for c in candles_trend { trend_ema = ema_50.next(c.close); }
-    let is_uptrend = candles_trend.last().unwrap().close > trend_ema;
-    let is_downtrend = candles_trend.last().unwrap().close < trend_ema;
-
-    let mut rsi = RelativeStrengthIndex::new(14).unwrap();
-    let mut macd = MovingAverageConvergenceDivergence::new(12, 26, 9).unwrap();
-    let mut atr = AverageTrueRange::new(14).unwrap();
-    
-    let mut rsi_values = Vec::new();
-    let mut latest_macd_hist = 0.0;
-    let mut latest_atr = 0.0;
-    let vol_period = 20;
-    let mut vol_sma = 0.0;
-
-    for c in candles_entry.iter() {
-        rsi_values.push(rsi.next(c.close));
-        latest_macd_hist = macd.next(c.close).histogram;
-        if let Ok(item) = ta::DataItem::builder().open(c.open).high(c.high).low(c.low).close(c.close).volume(c.volume).build() {
-            latest_atr = atr.next(&item);
-        }
-    }
-
-    if latest_atr <= 0.0 { return None; }
-
-    for i in (candles_entry.len() - vol_period - 1)..(candles_entry.len() - 1) {
-        vol_sma += candles_entry[i].volume;
-    }
-    vol_sma /= vol_period as f64;
-
-    let current_vol = candles_entry.last().unwrap().volume;
-    let vol_ratio = if vol_sma > 0.0 { current_vol / vol_sma } else { 1.0 };
-    let high_volume = vol_ratio > 1.5; 
-    
-    let pattern = detect_pattern(candles_entry);
-    let divergence = detect_divergence(candles_entry, &rsi_values);
-    let breakout = detect_sr_breakout(candles_entry);
-    let latest_rsi = *rsi_values.last().unwrap();
-
-    let current_candle = candles_entry.last().unwrap();
-    let candle_change_percent = ((current_candle.close - current_candle.open) / current_candle.open) * 100.0;
-
-    let mut long_score = 0;
-    let mut short_score = 0;
-
-    if latest_rsi < 25.0 {
-        short_score -= 5; 
-        long_score += 2;  
-    } else if latest_rsi > 75.0 {
-        long_score -= 5;  
-        short_score += 2; 
-    } else {
-        if latest_rsi > 50.0 && latest_rsi < 70.0 { long_score += 1; }
-        if latest_rsi < 50.0 && latest_rsi > 30.0 { short_score += 1; }
-    }
-
-    if is_uptrend { long_score += 2; }
-    if latest_macd_hist > 0.0 { long_score += 1; }
-    if high_volume { long_score += 1; }
-    if pattern == "Bullish Engulfing" || pattern == "Bullish Pinbar" { long_score += 1; }
-    if divergence == "Bullish Divergence" { long_score += 2; }
-    if breakout == "Bullish Breakout" { long_score += 2; }
-    long_score += news_pos.min(2); 
-
-    if is_downtrend { short_score += 2; }
-    if latest_macd_hist < 0.0 { short_score += 1; }
-    if high_volume { short_score += 1; }
-    if pattern == "Bearish Engulfing" || pattern == "Bearish Pinbar" { short_score += 1; }
-    if divergence == "Bearish Divergence" { short_score += 2; }
-    if breakout == "Bearish Breakdown" { short_score += 2; }
-    short_score += news_neg.min(2);
-
-    Some((long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio, latest_atr))
-}
-
-// 5. News Fetching
-async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
-    let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
-    let mut pos = 0; let mut neg = 0;
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(json) = resp.json::<Value>().await {
-            if let Some(articles) = json.get("articles").and_then(|v| v.as_array()) {
-                for article in articles {
-                    if let Some(sentiment) = article.get("sentiment").and_then(|v| v.as_str()) {
-                        match sentiment {
-                            "bullish" => pos += 1,
-                            "bearish" => neg += 1,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (pos, neg)
-}
-
-// 6. Main Analysis Function
-async fn analyze_asset(
-    client: &Client, 
-    symbol: &str, 
-    is_crypto: bool, 
-    finnhub_headlines: &[String],
-    cache: &SignalCache,
-    btc_bullish: Option<bool>,
-    strategy: &str,
-) -> Option<String> {
-    if !is_market_open(symbol) { return None; }
-
-    let (trend_tf, entry_tf) = match strategy {
-        "INTRADAY" => ("4h", "15m"),
-        "SWING" => ("1d", "1h"),
-        _ => ("1h", "5m"),
-    };
-
-    let (candles_trend, candles_entry) = if is_crypto {
-        tokio::join!(fetch_crypto_klines(client, symbol, trend_tf), fetch_crypto_klines(client, symbol, entry_tf))
-    } else {
-        tokio::join!(fetch_yahoo_klines(client, symbol, trend_tf), fetch_yahoo_klines(client, symbol, entry_tf))
-    };
-
-    if candles_trend.len() < 50 || candles_entry.len() < 35 { return None; }
-
-    let (pos_news, neg_news) = if symbol.ends_with("USDT") {
-        fetch_crypto_news(client, &symbol.replace("USDT", "")).await
-    } else if symbol.ends_with(".NS") {
-        (0, 0) 
-    } else {
-        let mut pos = 0; let mut neg = 0;
-        let base_symbol = symbol.split('.').next().unwrap_or(symbol).to_lowercase();
-        let search_term = match base_symbol.as_str() {
-            "gc=f" => "gold price", "si=f" => "silver price",
-            "aapl" => "apple", "msft" => "microsoft",
-            "googl" => "google", "amzn" => "amazon",
-            "tsla" => "tesla", _ => base_symbol.as_str(),
+async fn fetch_yahoo(client: &Client, symbol: &str, interval_str: &str, range: &str) -> Result<Vec<Candle>> {
+    let encoded = symbol.replace("=", "%3D").replace("^", "%5E");
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&range={}", encoded, interval_str, range);
+    let json = get_json(client, &url).await?;
+    let result = json["chart"]["result"].get(0).ok_or_else(|| anyhow!("Yahoo returned no chart data"))?;
+    let timestamps = result["timestamp"].as_array().ok_or_else(|| anyhow!("Yahoo timestamps missing"))?;
+    let q = &result["indicators"]["quote"][0];
+    let opens = q["open"].as_array().ok_or_else(|| anyhow!("Yahoo opens missing"))?;
+    let highs = q["high"].as_array().ok_or_else(|| anyhow!("Yahoo highs missing"))?;
+    let lows = q["low"].as_array().ok_or_else(|| anyhow!("Yahoo lows missing"))?;
+    let closes = q["close"].as_array().ok_or_else(|| anyhow!("Yahoo closes missing"))?;
+    let volumes = q["volume"].as_array();
+    let mut out = Vec::new();
+    for i in 0..timestamps.len() {
+        let get = |arr: &[serde_json::Value]| arr.get(i).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+        let ts = timestamps[i].as_i64().unwrap_or(0);
+        let c = Candle {
+            timestamp: ts, open: get(opens), high: get(highs), low: get(lows), close: get(closes),
+            volume: volumes.and_then(|v| v.get(i)).and_then(|v| v.as_f64()).unwrap_or(0.0),
         };
+        if c.open.is_finite() && c.high.is_finite() && c.low.is_finite() && c.close.is_finite() {
+            out.push(c);
+        }
+    }
+    let secs = match interval_str { "15m" => 900, "1h" => 3600, "1d" => 86400, _ => 900 };
+    let now = Utc::now().timestamp();
+    if out.last().map(|c| now - c.timestamp < secs as i64).unwrap_or(false) { out.pop(); }
+    Ok(out)
+}
 
-        for headline in finnhub_headlines {
-            if headline.contains(search_term) {
-                if headline.contains("surge") || headline.contains("bullish") || headline.contains("record high") || headline.contains("beat") { pos += 1; }
-                else if headline.contains("drop") || headline.contains("bearish") || headline.contains("crash") || headline.contains("earnings miss") { neg += 1; }
+async fn fetch_candles(client: &Client, asset: &Asset, tf: &str) -> Result<Vec<Candle>> {
+    match asset.kind {
+        AssetKind::Crypto => {
+            let mins = match tf { "1d" => 1440, "4h" => 240, "1h" => 60, _ => 5 };
+            fetch_kraken(client, asset.symbol, mins).await
+        }
+        _ => {
+            let (iv, range) = match tf {
+                "1d" => ("1d", "1y"),
+                "4h" => ("1h", "1mo"),
+                "1h" => ("1h", "3mo"),
+                _ => ("15m", "5d"),
+            };
+            fetch_yahoo(client, asset.symbol, iv, range).await
+        }
+    }
+}
+
+fn ema(values: &[f64], period: usize) -> Option<f64> {
+    if values.len() < period || period == 0 { return None; }
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut e = values[..period].iter().sum::<f64>() / period as f64;
+    for v in &values[period..] { e = v * k + e * (1.0 - k); }
+    Some(e)
+}
+
+fn rsi(values: &[f64], period: usize) -> Option<f64> {
+    if values.len() <= period { return None; }
+    let (mut gain, mut loss) = (0.0, 0.0);
+    for i in 1..=period {
+        let d = values[i] - values[i-1];
+        if d > 0.0 { gain += d; } else { loss -= d; }
+    }
+    let (mut ag, mut al) = (gain / period as f64, loss / period as f64);
+    for i in period+1..values.len() {
+        let d = values[i] - values[i-1];
+        ag = (ag * (period as f64 - 1.0) + d.max(0.0)) / period as f64;
+        al = (al * (period as f64 - 1.0) + (-d).max(0.0)) / period as f64;
+    }
+    if al == 0.0 { Some(100.0) } else { Some(100.0 - 100.0 / (1.0 + ag/al)) }
+}
+
+fn atr(c: &[Candle], period: usize) -> Option<f64> {
+    if c.len() <= period { return None; }
+    let mut trs = Vec::new();
+    for i in 1..c.len() {
+        let prev = c[i-1].close;
+        trs.push((c[i].high-c[i].low).max((c[i].high-prev).abs()).max((c[i].low-prev).abs()));
+    }
+    let mut value = trs[..period].iter().sum::<f64>() / period as f64;
+    for tr in &trs[period..] { value = (value*(period as f64-1.0)+tr)/period as f64; }
+    Some(value)
+}
+
+fn volume_ratio(c: &[Candle], period: usize) -> f64 {
+    if c.len() <= period { return 0.0; }
+    let base = c[c.len()-period-1..c.len()-1].iter().map(|x| x.volume).sum::<f64>() / period as f64;
+    if base <= 0.0 { 0.0 } else { c.last().unwrap().volume / base }
+}
+
+fn pivot_divergence(c: &[Candle], values: &[f64]) -> (bool, bool) {
+    if c.len() < 20 || values.len() != c.len() { return (false, false); }
+    let mut lows = Vec::new();
+    let mut highs = Vec::new();
+    for i in 2..c.len()-2 {
+        if c[i].low < c[i-1].low && c[i].low < c[i-2].low && c[i].low <= c[i+1].low && c[i].low <= c[i+2].low { lows.push(i); }
+        if c[i].high > c[i-1].high && c[i].high > c[i-2].high && c[i].high >= c[i+1].high && c[i].high >= c[i+2].high { highs.push(i); }
+    }
+    let bull = if lows.len() >= 2 {
+        let (a,b) = (lows[lows.len()-2], lows[lows.len()-1]);
+        c[b].low < c[a].low && values[b] > values[a] + 2.0
+    } else { false };
+    let bear = if highs.len() >= 2 {
+        let (a,b) = (highs[highs.len()-2], highs[highs.len()-1]);
+        c[b].high > c[a].high && values[b] < values[a] - 2.0
+    } else { false };
+    (bull, bear)
+}
+
+fn market_open(asset: &Asset) -> bool {
+    let now = Utc::now();
+    match asset.kind {
+        AssetKind::Crypto => true,
+        AssetKind::India => {
+            let t = now.with_timezone(&Kolkata);
+            !matches!(t.weekday(), Weekday::Sat | Weekday::Sun) &&
+            ((t.hour() > 9 || (t.hour() == 9 && t.minute() >= 15)) &&
+             (t.hour() < 15 || (t.hour() == 15 && t.minute() <= 30)))
+        }
+        AssetKind::Us => {
+            let t = now.with_timezone(&New_York);
+            !matches!(t.weekday(), Weekday::Sat | Weekday::Sun) &&
+            ((t.hour() > 9 || (t.hour() == 9 && t.minute() >= 30)) && (t.hour() < 16))
+        }
+        AssetKind::Metal => {
+            let t = now.with_timezone(&New_York);
+            !matches!(t.weekday(), Weekday::Sat) &&
+            !(t.weekday() == Weekday::Sun && t.hour() < 18) &&
+            !(t.weekday() == Weekday::Fri && t.hour() >= 17)
+        }
+    }
+}
+
+fn build_signal(asset: &Asset, entry: &[Candle], trend: &[Candle], btc_bullish: Option<bool>) -> Option<Signal> {
+    if !valid_candles(entry) || !valid_candles(trend) { return None; }
+    let closes: Vec<f64> = entry.iter().map(|c| c.close).collect();
+    let trend_closes: Vec<f64> = trend.iter().map(|c| c.close).collect();
+    let price = *closes.last()?;
+    let r = rsi(&closes, 14)?;
+    let a = atr(entry, 14)?;
+    let ema50 = ema(&trend_closes, 50)?;
+    
+    if !price.is_finite() || !a.is_finite() || a <= 0.0 || price <= 0.0 { return None; }
+
+    let last = entry.last()?;
+    let prev = &entry[entry.len()-2];
+    let uptrend = trend_closes.last()? > ema50;
+    let downtrend = trend_closes.last()? < ema50;
+    let vr = volume_ratio(entry, 20);
+    
+    let rsi_values: Vec<f64> = (0..closes.len())
+        .map(|i| if i >= 14 { rsi(&closes[..=i], 14).unwrap_or(50.0) } else { 50.0 })
+        .collect();
+    let (bull_div, bear_div) = pivot_divergence(entry, &rsi_values);
+
+    let bull_engulf = last.close > last.open && prev.close < prev.open && last.close >= prev.open && last.open <= prev.close;
+    let bear_engulf = last.close < last.open && prev.close > prev.open && last.open >= prev.close && last.close <= prev.open;
+
+    let range_high = entry[entry.len()-21..entry.len()-1].iter().map(|c| c.high).fold(f64::MIN, f64::max);
+    let range_low = entry[entry.len()-21..entry.len()-1].iter().map(|c| c.low).fold(f64::MAX, f64::min);
+    let bull_break = last.close > range_high;
+    let bear_break = last.close < range_low;
+
+    let mut long = 0;
+    let mut short = 0;
+
+    if r < 25.0 {
+        short -= 5; long += 2;
+    } else if r > 75.0 {
+        long -= 5; short += 2;
+    } else {
+        if uptrend && r >= 52.0 && r <= 68.0 { long += 2; }
+        if downtrend && r <= 48.0 && r >= 32.0 { short += 2; }
+    }
+
+    if bull_engulf { long += 1; }
+    if bear_engulf { short += 1; }
+    if bull_div { long += 2; }
+    if bear_div { short += 2; }
+    if bull_break { long += 2; }
+    if bear_break { short += 2; }
+
+    if vr >= 1.5 && last.close > last.open { long += 1; }
+    if vr >= 1.5 && last.close < last.open { short += 1; }
+
+    // BTC Macro Filter
+    if asset.kind == AssetKind::Crypto as i32 && asset.symbol != "BTCUSDT" {
+        if let Some(is_btc_bull) = btc_bullish {
+            if long >= 6 && !is_btc_bull { long -= 5; }
+            if short >= 6 && is_btc_bull { short -= 5; }
+        }
+    }
+
+    let (side, score) = if long >= 7 && long > short {
+        ("LONG", long)
+    } else if short >= 7 && short > long {
+        ("SHORT", short)
+    } else { return None; };
+
+    let sl_mult = match asset.strategy { Strategy::Swing => 3.0, Strategy::Intraday => 2.5, _ => 2.0 };
+    let tp_mult = match asset.strategy { Strategy::Swing => 6.0, Strategy::Intraday => 5.0, _ => 4.0 };
+
+    let stop_distance = (a * sl_mult).max(price * 0.002);
+    let (stop, target) = if side == "LONG" {
+        (price - stop_distance, price + (stop_distance * (tp_mult / sl_mult)))
+    } else {
+        (price + stop_distance, price - (stop_distance * (tp_mult / sl_mult)))
+    };
+    
+    if stop <= 0.0 || target <= 0.0 || !stop.is_finite() || !target.is_finite() { return None; }
+
+    let equity = env_f64("PAPER_EQUITY", 100000.0);
+    let risk_pct = env_f64("RISK_PER_TRADE_PCT", 0.5).clamp(0.05, 2.0);
+    let risk_amount = equity * risk_pct / 100.0;
+    let quantity = risk_amount / stop_distance;
+    
+    if !quantity.is_finite() || quantity <= 0.0 { return None; }
+
+    let strat_str = format!("{:?}", asset.strategy).to_uppercase();
+    
+    Some(Signal { 
+        symbol: asset.symbol.into(), side: side.into(), strategy: strat_str,
+        price, stop, target, quantity, risk_amount, score, rsi: r, atr: a, volume_ratio: vr, 
+        reason: format!("RSI {:.1}; Vol {:.1}x", r, vr)
+    })
+}
+
+async fn send_telegram(client: &Client, message: &str) -> Result<()> {
+    let token = env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN missing")?;
+    let chat = env::var("TELEGRAM_CHAT_ID").context("TELEGRAM_CHAT_ID missing")?;
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let body = serde_json::json!({ "chat_id": chat, "text": message, "parse_mode": "HTML", "disable_web_page_preview": true });
+    let resp = client.post(url).json(&body).send().await?;
+    if !resp.status().is_success() { return Err(anyhow!("Telegram API returned {}", resp.status())); }
+    Ok(())
+}
+
+fn format_signal(s: &Signal) -> String {
+    let emoji = if s.side == "LONG" { "🟢" } else { "🔴" };
+    format!(
+        "{} <b>PAPER SIGNAL — {} {}</b>\n\
+        ━━━━━━━━━━━━━━━━━━━━\n\
+        🌍 <b>Asset:</b> {}\n\
+        ⏰ <b>Type:</b> {}\n\
+        ━━━━━━━━━━━━━━━━━━━━\n\
+        💵 <b>Entry:</b> {:.6}\n\
+        🛑 <b>Stop:</b> {:.6}\n\
+        🎯 <b>Target:</b> {:.6}\n\
+        📊 <b>Score:</b> {}/10 🏆\n\
+        ━━━━━━━━━━━━━━━━━━━━\n\
+        🚀 <b>Qty:</b> {:.6}\n\
+        💰 <b>Risk:</b> {:.2}\n\
+        📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.2}x\n\
+        📝 <b>Reason:</b> {}\n\n\
+        <i>Signal only. No real order was placed.</i>",
+        emoji, s.symbol, s.side, s.symbol, s.strategy, s.price, s.stop, s.target, s.score.min(10), s.quantity, s.risk_amount, s.rsi, s.volume_ratio, s.reason
+    )
+}
+
+fn load_state() -> BotState {
+    fs::read_to_string(STATE_FILE).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+fn save_state(state: &BotState) -> Result<()> {
+    let tmp = format!("{}.tmp", STATE_FILE);
+    fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+    fs::rename(tmp, STATE_FILE)?;
+    Ok(())
+}
+
+fn manage_paper_trades(state: &mut BotState, latest: &HashMap<String, f64>) {
+    for trade in state.paper_trades.iter_mut().filter(|t| t.status == "OPEN") {
+        if let Some(price) = latest.get(&trade.symbol) {
+            let hit_stop = if trade.side == "LONG" { *price <= trade.stop } else { *price >= trade.stop };
+            let hit_target = if trade.side == "LONG" { *price >= trade.target } else { *price <= trade.target };
+            if hit_stop || hit_target {
+                trade.status = if hit_stop { "STOPPED" } else { "TARGET" }.into();
+                let r = if hit_stop { -1.0 } else { 2.0 };
+                state.daily_realized_r += r;
+                info!("Paper trade {} closed: {}", trade.id, trade.status);
             }
         }
-        (pos, neg)
-    };
+    }
+}
 
-    let (long_score, short_score, pattern, _divergence, _breakout, latest_rsi, candle_change, vol_ratio, atr) = 
-        get_scores(&candles_trend, &candles_entry, pos_news, neg_news)?;
+async fn scan_once(client: &Client, assets: &[Asset], state: &mut BotState) -> Result<()> {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    if state.day_key != today { state.day_key = today; state.daily_realized_r = 0.0; }
+
+    let max_daily_loss_r = env_f64("MAX_DAILY_LOSS_R", 3.0);
+    let mut latest = HashMap::new();
     
-    let current_price = candles_entry.last().unwrap().close;
-    let asset_name = symbol.replace("USDT", "").replace(".NS", "");
-
-    let long_score_out_of_100 = (long_score * 10).min(100).max(0);
-    let short_score_out_of_100 = (short_score * 10).min(100).max(0);
-
-    let (margin, currency_symbol) = if symbol.ends_with(".NS") { (5000.0, "₹") } else { (50.0, "$") };
-    let leverage = 10.0; 
-    let qty = (margin * leverage) / current_price; 
-    let qty_str = if is_crypto { format!("{:.5}", qty) } else { format!("{:.2}", qty) };
-
-    let now_ts = Utc::now().timestamp() as u64;
-    let cooldown = 3600;
-
-    if is_crypto && symbol != "BTCUSDT" && long_score >= 7 && long_score > short_score {
-        if let Some(is_btc_bull) = btc_bullish { if !is_btc_bull { return None; } }
-    }
-    if is_crypto && symbol != "BTCUSDT" && short_score >= 7 && short_score > long_score {
-        if let Some(is_btc_bull) = btc_bullish { if is_btc_bull { return None; } }
+    // Fetch BTC trend for macro filter
+    let mut btc_bullish = None;
+    if let Ok(btc_c) = fetch_candles(client, &Asset { symbol: "BTCUSDT", kind: AssetKind::Crypto, strategy: Strategy::Intraday }, "1h").await {
+        if valid_candles(&btc_c) {
+            let cc: Vec<f64> = btc_c.iter().map(|c| c.close).collect();
+            if let (Some(bema), Some(blast)) = (ema(&cc, 50), cc.last()) {
+                btc_bullish = Some(*blast > bema);
+            }
+        }
     }
 
-    if short_score >= 7 && short_score > long_score {
-        let cache_key = format!("{}_{}_SHORT", asset_name, strategy);
-        if let Some(&last_ts) = cache.signals.get(&cache_key) { if now_ts - last_ts < cooldown { return None; } }
-        if latest_rsi < 25.0 || candle_change < -1.2 { return None; }
-        
-        let sl_mult = if strategy == "SWING" { 3.0 } else if strategy == "INTRADAY" { 2.5 } else { 2.0 };
-        let tp_mult = if strategy == "SWING" { 6.0 } else if strategy == "INTRADAY" { 5.0 } else { 4.0 };
+    for asset in assets {
+        if !market_open(asset) { continue; }
+        let fetched = tokio::try_join!(
+            fetch_candles(client, asset, "15m"),
+            fetch_candles(client, asset, "1h")
+        );
+        let (entry, trend) = match fetched {
+            Ok(v) => v,
+            Err(e) => { warn!("{} data fetch failed: {:#}", asset.symbol, e); continue; }
+        };
+        if !valid_candles(&entry) || !valid_candles(&trend) { continue; }
+        let price = entry.last().unwrap().close;
+        latest.insert(asset.symbol.to_string(), price);
 
-        let sl = current_price + (atr * sl_mult); 
-        let tp = current_price - (atr * tp_mult);  
-        
-        return Some(format!(
-            "🔴 <b>SELL SIGNAL (SHORT)</b> 🔴\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            🌍 <b>Asset:</b> {}\n\
-            ⏰ <b>Type:</b> {} ({} Entry)\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            💵 <b>Price:</b> <code>{:.4}</code>\n\
-            🛑 <b>SL:</b> <code>{:.4}</code>\n\
-            🎯 <b>TP:</b> <code>{:.4}</code>\n\
-            📊 <b>Score:</b> {}/100 🏆\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            🚀 <b>Qty:</b> {} (Margin: {}{:.0}, 10x)\n\
-            📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
-            📰 <b>News:</b> {}",
-            asset_name, strategy, entry_tf, current_price, sl, tp, short_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if neg_news > 0 { "Negative" } else { "Neutral" }
-        ));
-    } else if long_score >= 7 && long_score > short_score {
-        let cache_key = format!("{}_{}_LONG", asset_name, strategy);
-        if let Some(&last_ts) = cache.signals.get(&cache_key) { if now_ts - last_ts < cooldown { return None; } }
-        if latest_rsi > 75.0 || candle_change > 1.2 { return None; }
+        if state.daily_realized_r <= -max_daily_loss_r {
+            warn!("Daily paper risk stop reached; no new signals today");
+            continue;
+        }
+        if state.paper_trades.iter().filter(|t| t.status == "OPEN").count() >= env_u64("MAX_OPEN_PAPER_TRADES", 5) as usize {
+            continue;
+        }
 
-        let sl_mult = if strategy == "SWING" { 3.0 } else if strategy == "INTRADAY" { 2.5 } else { 2.0 };
-        let tp_mult = if strategy == "SWING" { 6.0 } else if strategy == "INTRADAY" { 5.0 } else { 4.0 };
+        let Some(signal) = build_signal(asset, &entry, &trend, btc_bullish) else { continue; };
+        let key = format!("{}:{}:{}", signal.symbol, signal.side, signal.strategy);
+        let now = Utc::now().timestamp();
+        let cooldown = env_u64("SIGNAL_COOLDOWN_MINUTES", 60) as i64 * 60;
+        if now.saturating_sub(*state.last_signal.get(&key).unwrap_or(&0)) < cooldown { continue; }
 
-        let sl = current_price - (atr * sl_mult); 
-        let tp = current_price + (atr * tp_mult);  
-
-        return Some(format!(
-            "🟢 <b>BUY SIGNAL (LONG)</b> 🟢\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            🌍 <b>Asset:</b> {}\n\
-            ⏰ <b>Type:</b> {} ({} Entry)\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            💵 <b>Price:</b> <code>{:.4}</code>\n\
-            🛑 <b>SL:</b> <code>{:.4}</code>\n\
-            🎯 <b>TP:</b> <code>{:.4}</code>\n\
-            📊 <b>Score:</b> {}/100 🏆\n\
-            ━━━━━━━━━━━━━━━━━━━━\n\
-            🚀 <b>Qty:</b> {} (Margin: {}{:.0}, 10x)\n\
-            📈 <b>RSI:</b> {:.1} | <b>Vol:</b> {:.1}x | {}\n\
-            📰 <b>News:</b> {}",
-            asset_name, strategy, entry_tf, current_price, sl, tp, long_score_out_of_100, qty_str, currency_symbol, margin, latest_rsi, vol_ratio, pattern, if pos_news > 0 { "Positive" } else { "Neutral" }
-        ));
+        let id = format!("{}-{}", signal.symbol, now);
+        let message = format_signal(&signal);
+        match send_telegram(client, &message).await {
+            Ok(()) => {
+                state.last_signal.insert(key, now);
+                state.paper_trades.push(PaperTrade {
+                    id, symbol: signal.symbol.clone(), side: signal.side.clone(), entry: signal.price,
+                    stop: signal.stop, target: signal.target, quantity: signal.quantity,
+                    risk_amount: signal.risk_amount, opened_at: now, status: "OPEN".into()
+                });
+                info!("Sent {} {} paper signal ({})", signal.side, signal.symbol, signal.strategy);
+            }
+            Err(e) => error!("Telegram 
+             send failed for {}: {:#}", signal.symbol, e),
+        }
     }
-    None
+    manage_paper_trades(state, &latest);
+    save_state(state)?;
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    dotenvy::dotenv().ok();
-    let bot = Bot::from_env();
-    let chat_id_str = std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set");
-    let chat_id: i64 = chat_id_str.parse().expect("TELEGRAM_CHAT_ID must be a valid integer");
-    let chat_id = teloxide::types::ChatId(chat_id);
-    
-    let finnhub_key = std::env::var("FINNHUB_API_KEY").unwrap_or_default();
-    let client = Client::new();
-    
-    let crypto_symbols = vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-    let stock_symbols = vec!["RELIANCE.NS", "TCS.NS", "AAPL", "TSLA", "MSFT", "GC=F", "SI=F"];
+async fn main() -> Result<()> {
+    dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .init();
 
-    let cache_path = "signal_cache.json";
-    let cache_data = fs::read_to_string(cache_path).unwrap_or_else(|_| "{}".to_string());
-    let mut cache: SignalCache = serde_json::from_str(&cache_data).unwrap_or_default();
+    let client = Client::builder()
+        .timeout(StdDuration::from_secs(15))
+        .user_agent("Mozilla/5.0 RustSignalBotV2")
+        .build()?;
 
-    let mut btc_bullish = None;
-    let btc_1h = fetch_crypto_klines(&client, "BTCUSDT", "1h").await;
-    if btc_1h.len() >= 50 {
-        let mut ema = ExponentialMovingAverage::new(50).unwrap();
-        let mut last_ema = 0.0;
-        for c in &btc_1h { last_ema = ema.next(c.close); }
-        btc_bullish = Some(btc_1h.last().unwrap().close > last_ema);
-        println!("👑 BTC Macro Trend: {}", if btc_bullish.unwrap() { "BULLISH 🟢" } else { "BEARISH 🔴" });
-    }
+    let assets = vec![
+        Asset { symbol: "BTCUSDT", kind: AssetKind::Crypto, strategy: Strategy::Scalping },
+        Asset { symbol: "BTCUSDT", kind: AssetKind::Crypto, strategy: Strategy::Intraday },
+        Asset { symbol: "BTCUSDT", kind: AssetKind::Crypto, strategy: Strategy::Swing },
+        Asset { symbol: "ETHUSDT", kind: AssetKind::Crypto, strategy: Strategy::Scalping },
+        Asset { symbol: "ETHUSDT", kind: AssetKind::Crypto, strategy: Strategy::Intraday },
+        Asset { symbol: "ETHUSDT", kind: AssetKind::Crypto, strategy: Strategy::Swing },
+        Asset { symbol: "SOLUSDT", kind: AssetKind::Crypto, strategy: Strategy::Scalping },
+        Asset { symbol: "SOLUSDT", kind: AssetKind::Crypto, strategy: Strategy::Intraday },
+        Asset { symbol: "SOLUSDT", kind: AssetKind::Crypto, strategy: Strategy::Swing },
+        Asset { symbol: "RELIANCE.NS", kind: AssetKind::India, strategy: Strategy::Intraday },
+        Asset { symbol: "TCS.NS", kind: AssetKind::India, strategy: Strategy::Intraday },
+        Asset { symbol: "AAPL", kind: AssetKind::Us, strategy: Strategy::Intraday },
+        Asset { symbol: "TSLA", kind: AssetKind::Us, strategy: Strategy::Intraday },
+        Asset { symbol: "MSFT", kind: AssetKind::Us, strategy: Strategy::Intraday },
+        Asset { symbol: "GC=F", kind: AssetKind::Metal, strategy: Strategy::Intraday },
+        Asset { symbol: "SI=F", kind: AssetKind::Metal, strategy: Strategy::Intraday },
+    ];
 
-    let mut finnhub_headlines: Vec<String> = vec![];
-    if !finnhub_key.is_empty() {
-        let url = format!("https://finnhub.io/api/v1/news?category=general&token={}", finnhub_key);
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(json) = resp.json::<Value>().await {
-                if let Some(articles) = json.as_array() {
-                    for article in articles {
-                        if let Some(headline) = article.get("headline").and_then(|v| v.as_str()) {
-                            finnhub_headlines.push(headline.to_lowercase());
-                        }
-                    }
-                }
-            }
+    let mut state = load_state();
+    info!("Rust Signal Bot V2 started. Scan interval: {} minutes. LIVE ORDERS: DISABLED.", CYCLE_MINUTES);
+
+    let mut ticker = interval(StdDuration::from_secs(CYCLE_MINUTES * 60));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Err(e) = scan_once(&client, &assets, &mut state).await {
+            error!("Scan cycle failed: {:#}", e);
         }
     }
-
-    println!("🔍 Multi-Timeframe Scanner Running (Scalping, Intraday, Swing)...");
-
-    let mut tasks = vec![];
-    let strategies = vec!["SCALPING", "INTRADAY", "SWING"];
-
-    for strategy in strategies {
-        for symbol in &crypto_symbols {
-            tasks.push(analyze_asset(&client, symbol, true, &finnhub_headlines, &cache, btc_bullish, strategy));
-        }
-        for symbol in &stock_symbols {
-            tasks.push(analyze_asset(&client, symbol, false, &finnhub_headlines, &cache, None, strategy));
-        }
-    }
-
-    let results = join_all(tasks).await;
-    let now_ts = Utc::now().timestamp() as u64;
-
-    for result in results {
-        if let Some(msg) = result {
-            let dir = if msg.contains("SELL SIGNAL") { "SHORT" } else { "LONG" };
-            let strategy = if msg.contains("INTRADAY") { "INTRADAY" } else if msg.contains("SWING") { "SWING" } else { "SCALPING" };
-            let mut asset_name_opt = None;
-            
-            if let Some(asset_start) = msg.find("<b>Asset:</b> ") {
-                let asset_part = &msg[asset_start + 14..];
-                if let Some(end_idx) = asset_part.find('\n') {
-                    asset_name_opt = Some(asset_part[..end_idx].trim().to_string());
-                }
-            }
-
-            if let Err(e) = bot.send_message(chat_id.clone(), msg).parse_mode(ParseMode::Html).await {
-                eprintln!("❌ Failed to send message: {}", e);
-            } else {
-                println!("✅ Signal Sent!");
-                if let Some(asset_name) = asset_name_opt {
-                    cache.signals.insert(format!("{}_{}_{}", asset_name, strategy, dir), now_ts);
-                }
-            }
-        }
-    }
-
-    if let Ok(json_str) = serde_json::to_string_pretty(&cache) {
-        let _ = fs::write(cache_path, json_str);
-    }
-    
-    println!("✅ Scan complete.");
-}
+               }
