@@ -2,13 +2,14 @@ name: Rust Crypto Signal Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch:
+    - cron: '*/15 * * * *' # Har 15 minute mein chalega
+  workflow_dispatch: # Manual run karne ke liye
 
-jobs:
 concurrency:
   group: trading-bot
   cancel-in-progress: false
+
+jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
@@ -21,7 +22,7 @@ concurrency:
       - name: Cache Signals
         uses: actions/cache@v3
         with:
-          path: signal_cache.json
+          path: bot_state_v2.json
           key: signal-cache-${{ github.run_id }}
           restore-keys: |
             signal-cache-
@@ -31,6 +32,5 @@ concurrency:
           TELOXIDE_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           RUST_LOG: info
         run: cargo run --release
