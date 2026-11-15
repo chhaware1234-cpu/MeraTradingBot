@@ -325,7 +325,7 @@ fn build_signal(asset: &Asset, entry: &[Candle], trend: &[Candle], btc_bullish: 
     if vr >= 1.5 && last.close < last.open { short += 1; }
 
     // BTC Macro Filter
-    if asset.kind == AssetKind::Crypto as && asset.symbol != "BTCUSDT" {
+    if asset.kind == AssetKind::Crypto && asset.symbol != "BTCUSDT" {
         if let Some(is_btc_bull) = btc_bullish {
             if long >= 6 && !is_btc_bull { long -= 5; }
             if short >= 6 && is_btc_bull { short -= 5; }
