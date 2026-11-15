@@ -56,7 +56,7 @@ async fn fetch_crypto_klines(client: &Client, symbol: &str, interval: &str) -> V
                                     }
                                 }
                             }
-                            candles.pop();
+                            candles.pop(); // Drop incomplete
                             if candles.len() > 200 { return candles[candles.len() - 200..].to_vec(); }
                             return candles;
                         }
@@ -225,8 +225,18 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     let mut long_score = 0;
     let mut short_score = 0;
 
+    if latest_rsi < 25.0 {
+        short_score -= 5; 
+        long_score += 2;  
+    } else if latest_rsi > 75.0 {
+        long_score -= 5;  
+        short_score += 2; 
+    } else {
+        if latest_rsi > 50.0 && latest_rsi < 70.0 { long_score += 1; }
+        if latest_rsi < 50.0 && latest_rsi > 30.0 { short_score += 1; }
+    }
+
     if is_uptrend { long_score += 2; }
-    if latest_rsi > 50.0 && (latest_rsi < 70.0 || breakout == "Bullish Breakout") { long_score += 1; } 
     if latest_macd_hist > 0.0 { long_score += 1; }
     if high_volume { long_score += 1; }
     if pattern == "Bullish Engulfing" || pattern == "Bullish Pinbar" { long_score += 1; }
@@ -235,7 +245,6 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     long_score += news_pos.min(2); 
 
     if is_downtrend { short_score += 2; }
-    if latest_rsi < 50.0 && (latest_rsi > 30.0 || breakout == "Bearish Breakdown") { short_score += 1; } 
     if latest_macd_hist < 0.0 { short_score += 1; }
     if high_volume { short_score += 1; }
     if pattern == "Bearish Engulfing" || pattern == "Bearish Pinbar" { short_score += 1; }
@@ -246,7 +255,6 @@ fn get_scores(candles_1h: &[Candle], candles_5m: &[Candle], news_pos: i32, news_
     Some((long_score, short_score, pattern.to_string(), divergence.to_string(), breakout.to_string(), latest_rsi, candle_change_percent, vol_ratio, latest_atr))
 }
 
-// CRYPTO NEWS FIX: Now parses the "articles" array correctly
 async fn fetch_crypto_news(client: &Client, coin: &str) -> (i32, i32) {
     let url = format!("https://cryptocurrency.cv/api/ai/sentiment?asset={}", coin);
     let mut pos = 0; let mut neg = 0;
@@ -274,6 +282,7 @@ async fn analyze_asset(
     is_crypto: bool, 
     finnhub_headlines: &[String],
     cache: &SignalCache,
+    btc_bullish: Option<bool>,
 ) -> Option<String> {
     if !is_market_open(symbol) { return None; }
 
@@ -308,14 +317,14 @@ async fn analyze_asset(
         (pos, neg)
     };
 
-    let (long_score, short_score, pattern, _divergence, breakout, latest_rsi, candle_change, vol_ratio, atr) = 
+    let (long_score, short_score, pattern, _divergence, _breakout, latest_rsi, candle_change, vol_ratio, atr) = 
         get_scores(&candles_1h, &candles_5m, pos_news, neg_news)?;
     
     let current_price = candles_5m.last().unwrap().close;
     let asset_name = symbol.replace("USDT", "").replace(".NS", "");
 
-    let long_score_out_of_100 = (long_score * 10).min(100);
-    let short_score_out_of_100 = (short_score * 10).min(100);
+    let long_score_out_of_100 = (long_score * 10).min(100).max(0);
+    let short_score_out_of_100 = (short_score * 10).min(100).max(0);
 
     let (margin, currency_symbol) = if symbol.ends_with(".NS") {
         (5000.0, "₹")
@@ -330,13 +339,25 @@ async fn analyze_asset(
     let now_ts = Utc::now().timestamp() as u64;
     let cooldown = 3600;
 
+    // BTC MACRO FILTER
+    if is_crypto && symbol != "BTCUSDT" && long_score >= 7 && long_score > short_score {
+        if let Some(is_btc_bull) = btc_bullish {
+            if !is_btc_bull { return None; }
+        }
+    }
+    if is_crypto && symbol != "BTCUSDT" && short_score >= 7 && short_score > long_score {
+        if let Some(is_btc_bull) = btc_bullish {
+            if is_btc_bull { return None; }
+        }
+    }
+
     if short_score >= 7 && short_score > long_score {
         let cache_key = format!("{}_SHORT", asset_name);
         if let Some(&last_ts) = cache.signals.get(&cache_key) {
             if now_ts - last_ts < cooldown { return None; }
         }
 
-        if (latest_rsi < 25.0 || candle_change < -1.2) && breakout != "Bearish Breakdown" { return None; }
+        if latest_rsi < 25.0 || candle_change < -1.2 { return None; }
         
         let sl = current_price + (atr * 2.0); 
         let tp = current_price - (atr * 4.0);  
@@ -363,7 +384,7 @@ async fn analyze_asset(
             if now_ts - last_ts < cooldown { return None; }
         }
 
-        if (latest_rsi > 75.0 || candle_change > 1.2) && breakout != "Bullish Breakout" { return None; }
+        if latest_rsi > 75.0 || candle_change > 1.2 { return None; }
 
         let sl = current_price - (atr * 2.0); 
         let tp = current_price + (atr * 4.0);  
@@ -406,6 +427,17 @@ async fn main() {
     let cache_data = fs::read_to_string(cache_path).unwrap_or_else(|_| "{}".to_string());
     let mut cache: SignalCache = serde_json::from_str(&cache_data).unwrap_or_default();
 
+    // BTC Macro Trend
+    let mut btc_bullish = None;
+    let btc_1h = fetch_crypto_klines(&client, "BTCUSDT", "1h").await;
+    if btc_1h.len() >= 50 {
+        let mut ema = ExponentialMovingAverage::new(50).unwrap();
+        let mut last_ema = 0.0;
+        for c in &btc_1h { last_ema = ema.next(c.close); }
+        btc_bullish = Some(btc_1h.last().unwrap().close > last_ema);
+        println!("👑 BTC Macro Trend: {}", if btc_bullish.unwrap() { "BULLISH 🟢" } else { "BEARISH 🔴" });
+    }
+
     let mut finnhub_headlines: Vec<String> = vec![];
     if !finnhub_key.is_empty() {
         let url = format!("https://finnhub.io/api/v1/news?category=general&token={}", finnhub_key);
@@ -422,14 +454,14 @@ async fn main() {
         }
     }
 
-    println!("🔍 Pro-Scanner V6 Running (All Fixes Applied)...");
+    println!("🔍 Pro-Scanner Final Version Running...");
 
     let mut tasks = vec![];
     for symbol in &crypto_symbols {
-        tasks.push(analyze_asset(&client, symbol, true, &finnhub_headlines, &cache));
+        tasks.push(analyze_asset(&client, symbol, true, &finnhub_headlines, &cache, btc_bullish));
     }
     for symbol in &stock_symbols {
-        tasks.push(analyze_asset(&client, symbol, false, &finnhub_headlines, &cache));
+        tasks.push(analyze_asset(&client, symbol, false, &finnhub_headlines, &cache, None));
     }
 
     let results = join_all(tasks).await;
