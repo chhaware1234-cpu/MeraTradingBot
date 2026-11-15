@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
   run-bot:
     runs-on: ubuntu-latest
     steps:
