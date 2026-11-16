@@ -489,7 +489,6 @@ async fn scan_once(client: &Client, assets: &[Asset], state: &mut BotState) -> R
     save_state(state)?;
     Ok(())
 }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
@@ -522,14 +521,13 @@ async fn main() -> Result<()> {
     ];
 
     let mut state = load_state();
-    info!("Rust Signal Bot V2 started. Scan interval: {} minutes. LIVE ORDERS: DISABLED.", CYCLE_MINUTES);
+    info!("Rust Signal Bot V2 started. Running single scan cycle.");
 
-    let mut ticker = interval(StdDuration::from_secs(CYCLE_MINUTES * 60));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-        if let Err(e) = scan_once(&client, &assets, &mut state).await {
-            error!("Scan cycle failed: {:#}", e);
-        }
+    // Yahan loop hata kar sirf ek baar scan_once call kiya gaya hai
+    if let Err(e) = scan_once(&client, &assets, &mut state).await {
+        error!("Scan cycle failed: {:#}", e);
     }
-               }
+
+    info!("Scan cycle complete. Exiting.");
+    Ok(())
+}
