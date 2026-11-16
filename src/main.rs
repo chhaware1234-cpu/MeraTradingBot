@@ -332,9 +332,9 @@ fn build_signal(asset: &Asset, entry: &[Candle], trend: &[Candle], btc_bullish: 
         }
     }
 
-    let (side, score) = if long >= 7 && long > short {
+    let (side, score) = if long >= 4 && long > short {
         ("LONG", long)
-    } else if short >= 7 && short > long {
+    } else if short >= 4 && short > long {
         ("SHORT", short)
     } else { return None; };
 
